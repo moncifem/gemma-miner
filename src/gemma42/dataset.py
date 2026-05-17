@@ -85,17 +85,24 @@ class Dataset:
         """
         if not isinstance(row, dict):
             return False, "row must be a dict"
-        if not self.unique_key:
+        key_field = self.unique_key
+        if key_field is None and "id" in row:
+            # Most harvesting tools synthesize a stable `id` even when the
+            # user did not request a unique field. Treat it as the implicit
+            # upsert key so schema extraction enriches rows instead of
+            # duplicating the corpus.
+            key_field = "id"
+        if not key_field:
             ok, reason = self.append(row)
             return ok, reason
-        key = row.get(self.unique_key)
+        key = row.get(key_field)
         if key is None:
-            return False, f"missing unique key '{self.unique_key}'"
+            return False, f"missing unique key '{key_field}'"
         key_s = str(key)
         with self._lock:
             replaced = False
             for i, existing in enumerate(self._rows):
-                if str(existing.get(self.unique_key)) == key_s:
+                if str(existing.get(key_field)) == key_s:
                     # Merge keeping new values where non-null, else old.
                     merged = dict(existing)
                     for k, v in row.items():

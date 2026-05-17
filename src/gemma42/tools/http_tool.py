@@ -150,8 +150,14 @@ class HttpGetTool(Tool):
         "`cache/` folder, named `<sha1-prefix><real-extension>` (.json, .html, "
         ".pdf, .xml, .csv, .zip, etc. — picked from Content-Type, then URL "
         "suffix, then magic bytes). Returns: status code, content-type, byte "
-        "length, the cache file path, and the FIRST 2000 chars of the body. "
-        "Use this for any web fetch — never use bash curl for the same purpose."
+        "length, the cache file path, and a body preview.\n\n"
+        "Preview defaults to 8 000 characters (anchored at <main>/<article>/<body> "
+        "for HTML so you don't waste tokens on chrome). For deeper inspection, "
+        "either pass `preview_chars=<bigger N>` on this call, or use "
+        "`html_inspect`/`read_file` on the cache_path afterwards (cheaper than "
+        "putting the whole body in every subsequent prompt). Set `preview_chars=0` "
+        "to skip the preview entirely.\n\nUse this for any web fetch — never "
+        "use bash curl for the same purpose."
     )
     args_schema = {
         "url": {"type": "string", "description": "Absolute URL to fetch."},
@@ -162,8 +168,8 @@ class HttpGetTool(Tool):
         },
         "preview_chars": {
             "type": "integer",
-            "description": "How many chars of body to include in the output.",
-            "default": 2000,
+            "description": "How many chars of body to include in the output. Default 8000.",
+            "default": 8_000,
         },
     }
 
@@ -172,7 +178,7 @@ class HttpGetTool(Tool):
         if not url:
             return ToolResult(output="ERROR: 'url' is required", error=True)
         ua = args.get("user_agent") or "Mozilla/5.0 (gemma42 research agent)"
-        preview = int(args.get("preview_chars") or 2000)
+        preview = int(args.get("preview_chars") or 8_000)
 
         cache_dir = Path(state.workdir) / "cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -226,12 +232,32 @@ class HttpGetTool(Tool):
             text = "<binary>"
         body_preview, body_offset = _body_preview(text, preview)
 
+        # Flag non-success responses so the agent doesn't try to extract data
+        # from a 403/404/etc. page. We still cache the body (it can help
+        # diagnose) but mark the tool result as an error.
+        is_error_status = status >= 400
+        warning = ""
+        if is_error_status:
+            warning = (
+                f"\n⚠ HTTP {status} — this is NOT the page content. "
+                "The site refused (403), the URL is wrong (404), or the "
+                "server failed (5xx). Trying to scrape this cached body will "
+                "yield nothing useful. Options:\n"
+                "  • Pick a different URL (the listing page may already have "
+                "    what you need — try `dataset_from_queue` on existing items).\n"
+                "  • Set a real User-Agent header via http_get(user_agent='...').\n"
+                "  • Stop trying to fetch this domain.\n"
+            )
         out = (
             f"status: {status}\n"
             f"content_type: {ctype}\n"
             f"bytes: {len(content)}\n"
             f"cache_path: {cache_path}\n"
-            f"--- body preview ({len(body_preview)} chars, offset {body_offset} of {len(text)}) ---\n"
+            + warning
+            + f"--- body preview ({len(body_preview)} chars, offset {body_offset} of {len(text)}) ---\n"
             f"{body_preview}"
         )
-        return ToolResult(output=out, artifact={"path": str(cache_path), "status": status})
+        return ToolResult(
+            output=out, error=is_error_status,
+            artifact={"path": str(cache_path), "status": status},
+        )

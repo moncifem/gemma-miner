@@ -54,9 +54,9 @@ presets:
 | Provider | Default model | API key env |
 |---|---|---|
 | `together` | `google/gemma-3n-E4B-it` | `TOGETHER_API_KEY` |
-| `ollama` | `gemma3:27b` (local) | — |
+| `ollama` | `gemma4:latest` (local) | — |
 | `groq` | `llama-3.1-70b-versatile` | `GROQ_API_KEY` |
-| `openrouter` | `google/gemma-3-27b-it` | `OPENROUTER_API_KEY` |
+| `openrouter` | `google/gemini-3.1-pro-preview` | `OPENROUTER_API_KEY` |
 | `fireworks` | `accounts/fireworks/models/gemma2-27b-it` | `FIREWORKS_API_KEY` |
 | `openai` | `gpt-4o-mini` | `OPENAI_API_KEY` |
 | `openai-compatible` | (pass `--base-url` + `--model`) | optional |
@@ -64,24 +64,28 @@ presets:
 ```python
 from gemma42 import make_llm
 
-llm = make_llm("ollama", model="gemma3:27b")        # local 27B-class
-llm = make_llm("together", model="google/gemma-3n-E4B-it")
+llm = make_llm("ollama", model="gemma4:latest")        # local extraction
+llm = make_llm("openrouter", model="google/gemini-3.1-pro-preview")
 llm = make_llm("openai-compatible",
                base_url="http://my-vllm:8000/v1",
                model="meta-llama/Meta-Llama-3.1-8B-Instruct")
 ```
 
-For a 31B-ish local model with Ollama:
+For local schema-constrained extraction with Ollama:
 
 ```bash
-ollama pull gemma3:27b      # closest to "Gemma 3 ~31B"
-gemma42 run --provider ollama --model gemma3:27b ...
+ollama pull gemma4:latest
+gemma42 ask "scrape ..." \
+  --provider openrouter \
+  --model google/gemini-3.1-pro-preview \
+  --extract-provider ollama \
+  --extract-model gemma4:latest
 ```
 
 ## Quick start (CLI)
 
 ```bash
-export TOGETHER_API_KEY=...
+export OPENROUTER_API_KEY=...
 
 gemma42 run \
   --goal "Build a dataset of the current top 100 Hacker News stories with rank, id, title, domain, and points. Use the public JSON API at hacker-news.firebaseio.com." \
@@ -89,7 +93,10 @@ gemma42 run \
   --required-fields rank,id,title,points \
   --unique-field id \
   --workdir ./runs/hn \
-  --model "google/gemma-3n-E4B-it"
+  --provider openrouter \
+  --model "google/gemini-3.1-pro-preview" \
+  --extract-provider ollama \
+  --extract-model "gemma4:latest"
 ```
 
 When the run finishes you get `runs/hn/dataset.jsonl`. Push it:
@@ -102,8 +109,8 @@ gemma42 export-hf ./runs/hn/dataset.jsonl --repo-id yourname/hn-top100
 
 ```python
 from gemma42 import (
-    FieldsContract, LLMClient, MinRowsContract,
-    UniqueFieldContract, run_agent,
+    FieldsContract, MinRowsContract, UniqueFieldContract,
+    make_llm, run_agent,
 )
 
 result = run_agent(
@@ -118,7 +125,8 @@ result = run_agent(
     ],
     unique_key="id",
     workdir="./runs/hn",
-    llm=LLMClient(model="google/gemma-3n-E4B-it"),
+    llm=make_llm("openrouter", model="google/gemini-3.1-pro-preview"),
+    extraction_llm=make_llm("ollama", model="gemma4:latest"),
 )
 print(result)
 ```

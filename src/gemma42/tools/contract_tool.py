@@ -20,12 +20,18 @@ if TYPE_CHECKING:
 class AddContractTool(Tool):
     name = "add_contract"
     description = (
-        "Add (or replace) a contract that must be satisfied before the run can "
-        "finish. Supported kinds:\n"
-        "  - min_rows         args: {min_rows: int}\n"
-        "  - required_fields  args: {fields: [str, ...]}\n"
-        "  - unique_field     args: {field: str}\n"
-        "If a contract with the same kind already exists, it is replaced."
+        "Add (or replace) a hard contract that gates the `finish` tool. "
+        "REQUIRED FIRST ARG `kind` — one of EXACTLY these three strings:\n"
+        "  • \"min_rows\"         → also pass {min_rows: <int>}\n"
+        "  • \"required_fields\"  → also pass {fields: [<str>, ...]}\n"
+        "  • \"unique_field\"     → also pass {field: <str>}\n\n"
+        "Examples:\n"
+        "  add_contract(kind=\"min_rows\", min_rows=30)\n"
+        "  add_contract(kind=\"required_fields\", fields=[\"title\",\"score\"])\n"
+        "  add_contract(kind=\"unique_field\", field=\"id\")\n\n"
+        "Most runs do NOT need to call this — contracts are set at run start "
+        "from the user's request. Only use add_contract when the user changes "
+        "their spec mid-run (e.g. 'actually I also need a date field')."
     )
     args_schema = {
         "kind": {
@@ -43,6 +49,16 @@ class AddContractTool(Tool):
 
     def run(self, args: dict, state: "AgentState") -> ToolResult:
         kind = args.get("kind")
+        valid_kinds = ("min_rows", "required_fields", "unique_field")
+        if kind not in valid_kinds:
+            return ToolResult(
+                output=(
+                    f"ERROR: 'kind' must be one of {valid_kinds}, got {kind!r}. "
+                    "Example: add_contract(kind=\"required_fields\", "
+                    "fields=[\"title\", \"score\"])."
+                ),
+                error=True,
+            )
         if kind == "min_rows":
             n = int(args.get("min_rows") or 0)
             if n <= 0:
@@ -55,13 +71,12 @@ class AddContractTool(Tool):
                 return ToolResult(output="ERROR: 'fields' list required", error=True)
             state.contracts.add(FieldsContract(required_fields=list(fields)))
             return ToolResult(output=f"added contract: required_fields={fields}")
-        if kind == "unique_field":
-            f = args.get("field")
-            if not f:
-                return ToolResult(output="ERROR: 'field' required", error=True)
-            state.contracts.add(UniqueFieldContract(field=f))
-            return ToolResult(output=f"added contract: unique_field='{f}'")
-        return ToolResult(output=f"ERROR: unknown kind '{kind}'", error=True)
+        # unique_field
+        f = args.get("field")
+        if not f:
+            return ToolResult(output="ERROR: 'field' required", error=True)
+        state.contracts.add(UniqueFieldContract(field=f))
+        return ToolResult(output=f"added contract: unique_field='{f}'")
 
 
 class ContractStatusTool(Tool):

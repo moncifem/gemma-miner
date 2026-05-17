@@ -21,6 +21,9 @@ _REF_RESOLVE_ALLOWED = {
     "codebook_propose",
     "codebook_test",
     "extract_items",
+    "codebook_design",
+    "audit_dataset",
+    "dataset_report",
 }
 
 
@@ -69,19 +72,47 @@ class ToolRegistry:
             return ToolResult(output=f"ERROR: {type(e).__name__}: {e}", error=True)
 
 
-def default_registry(llm=None) -> ToolRegistry:
-    """Build the default tool set. `llm` is needed for extract_structured."""
+def default_registry(llm=None, extraction_llm=None) -> ToolRegistry:
+    """Build the default tool set.
+
+    `llm` drives the agentic/reconnaissance tools. `extraction_llm` is used
+    only for schema-constrained extraction tools; when omitted we preserve the
+    historical single-client behavior.
+    """
     from gemma42.tools.contract_tool import AddContractTool, ContractStatusTool
     from gemma42.tools.dataset_tool import (
         DatasetAppendTool,
+        DatasetFromQueueTool,
         DatasetSampleTool,
         DatasetStatsTool,
     )
+    from gemma42.tools.autobiography_tool import (
+        AutobiographyLessonTool,
+        AutobiographyRecallTool,
+        AutobiographyStatsTool,
+    )
+    from gemma42.tools.cloud_tool import CloudPullTool, CloudPushTool, CloudSearchTool
     from gemma42.tools.codebook_tool import (
         CodebookEditTool,
         CodebookProposeTool,
         CodebookShowTool,
         CodebookTestTool,
+    )
+    from gemma42.tools.constitution_tool import (
+        DatasetVerifyTool,
+        RuleAddTool,
+        RuleListTool,
+        RulesInferTool,
+    )
+    from gemma42.tools.dashboard_tool import DashboardStartTool
+    from gemma42.tools.fingerprint_tool import FingerprintCheckTool, RecipeSaveTool
+    from gemma42.tools.gdt_tool import GoalTreeTool
+    from gemma42.tools.kernel_tool import KernelResetTool, PyKernelTool, SkillPromoteTool
+    from gemma42.tools.manifest_tool import DatasetDiffTool, ManifestWriteTool
+    from gemma42.tools.swarm_tool import (
+        AuditDatasetTool,
+        CodebookDesignTool,
+        DatasetReportTool,
     )
     from gemma42.tools.export_tool import (
         DatasetExportTool,
@@ -105,9 +136,12 @@ def default_registry(llm=None) -> ToolRegistry:
         QueueStatusTool,
     )
     from gemma42.tools.finish_tool import FinishTool
-    from gemma42.tools.html_tool import HtmlExtractTool, HtmlInspectTool
+    from gemma42.tools.assess_sample_tool import AssessSampleTool
+    from gemma42.tools.discover_assets_tool import DiscoverAssetsTool
+    from gemma42.tools.html_tool import HtmlExtractTool, HtmlFindTool, HtmlInspectTool
     from gemma42.tools.http_tool import HttpGetTool
     from gemma42.tools.memory_tool import MemoryGetTool, MemoryListTool, MemorySetTool
+    from gemma42.tools.plan_tool import SetPlanTool, ShowPlanTool
     from gemma42.tools.shell_tool import BashTool, PythonExecTool
 
     tools: list[Tool] = [
@@ -115,6 +149,8 @@ def default_registry(llm=None) -> ToolRegistry:
         HttpGetTool(),
         HtmlInspectTool(),
         HtmlExtractTool(),
+        HtmlFindTool(),
+        DiscoverAssetsTool(),
         # Declarative extraction (the preferred path for scraping)
         ExtractorDefineTool(),
         ScrapePaginatedTool(),
@@ -130,8 +166,10 @@ def default_registry(llm=None) -> ToolRegistry:
         SaveAttachmentTool(),
         # Dataset
         DatasetAppendTool(),
+        DatasetFromQueueTool(),
         DatasetStatsTool(),
         DatasetSampleTool(),
+        AssessSampleTool(),
         # Queue
         QueueAddTool(),
         QueueNextTool(),
@@ -141,20 +179,58 @@ def default_registry(llm=None) -> ToolRegistry:
         MemoryGetTool(),
         MemorySetTool(),
         MemoryListTool(),
+        # Plan (set once after discovery; followed for the rest of the run)
+        SetPlanTool(),
+        ShowPlanTool(),
         # Validation & export
         DatasetValidateTool(),
         DatasetExportTool(),
         HFPushTool(),
+        # Constitution
+        RuleAddTool(),
+        RuleListTool(),
+        RulesInferTool(),
+        DatasetVerifyTool(),
+        # Goal tree
+        GoalTreeTool(),
+        # Autobiography (L3 + L4)
+        AutobiographyStatsTool(),
+        AutobiographyRecallTool(),
+        AutobiographyLessonTool(),
+        # Fingerprint + recipe cache
+        FingerprintCheckTool(),
+        RecipeSaveTool(),
+        # Persistent Python kernel
+        PyKernelTool(),
+        KernelResetTool(),
+        SkillPromoteTool(),
+        # Provenance + manifest + diff
+        ManifestWriteTool(),
+        DatasetDiffTool(),
+        # Federated cloud
+        CloudSearchTool(),
+        CloudPushTool(),
+        CloudPullTool(),
+        # Live dashboard
+        DashboardStartTool(),
         # Contracts & finish
         AddContractTool(),
         ContractStatusTool(),
         FinishTool(),
     ]
     if llm is not None:
-        tools.append(ExtractStructuredTool(llm=llm))
+        from gemma42.tools.llm_scrape_tool import LLMScrapeTool
+
+        extractor_llm = extraction_llm or llm
+        tools.append(ExtractStructuredTool(llm=extractor_llm))
         tools.append(CodebookProposeTool(llm=llm))
-        tools.append(CodebookTestTool(llm=llm))
-        tools.append(ExtractItemsTool(llm=llm))
+        tools.append(CodebookTestTool(llm=extractor_llm))
+        tools.append(ExtractItemsTool(llm=extractor_llm))
+        tools.append(LLMScrapeTool(llm=llm))
+        # Specialist swarm (LLM-driven)
+        tools.append(CodebookDesignTool(llm=llm))
+        tools.append(AuditDatasetTool(llm=llm))
+        tools.append(DatasetReportTool(llm=llm))
     # The non-LLM codebook tools
     tools.append(CodebookShowTool())
     tools.append(CodebookEditTool())

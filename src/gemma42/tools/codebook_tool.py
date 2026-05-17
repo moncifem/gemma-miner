@@ -210,7 +210,17 @@ def _stratified_sample(rows: list[dict], k: int) -> list[dict]:
 
 
 def _row_text(row: dict, workdir: str) -> str:
-    """Return the textual content of a row by reading from text_path, else pdf_text."""
+    """Return textual content from a row.
+
+    Priority:
+      1. File-path fields (text_path, txt_path, …) — read from disk.
+      2. Heavy in-row text fields (pdf_text, text, body, content) > 200 chars.
+      3. Fallback: any non-id, non-url string field (or list of strings).
+         Concatenated as `field: value` lines so the codebook designer has
+         SOMETHING to work with, even when the rows are short structured
+         records (e.g. {date, org_type, decision_adopted}).
+    """
+    # 1. file-path fields
     for field in ("text_path", "txt_path", "txt_file", "text_file"):
         path = row.get(field)
         if isinstance(path, str):
@@ -222,11 +232,31 @@ def _row_text(row: dict, workdir: str) -> str:
                     return p.read_text(encoding="utf-8", errors="replace")
                 except Exception:  # noqa: BLE001
                     pass
+    # 2. heavy in-row text
     for field in ("pdf_text", "text", "body", "content"):
         v = row.get(field)
         if isinstance(v, str) and len(v) > 200:
             return v
-    return ""
+    # 3. fallback: concatenate every meaningful string field on the row.
+    SKIP = {"id"} | {
+        "text_path", "txt_path", "txt_file", "text_file",
+        "pdf_text", "pdf_path", "attachment", "attachment_path",
+    }
+    pieces: list[str] = []
+    for k, v in row.items():
+        if k in SKIP or str(k).startswith("_"):
+            continue
+        if isinstance(v, str):
+            if not v.strip():
+                continue
+            pieces.append(f"{k}: {v}")
+        elif isinstance(v, (int, float, bool)):
+            pieces.append(f"{k}: {v}")
+        elif isinstance(v, list) and v:
+            joined = ", ".join(str(x) for x in v[:20] if x is not None)
+            if joined:
+                pieces.append(f"{k}: {joined}")
+    return "\n".join(pieces)
 
 
 # ── codebook_show ──────────────────────────────────────────────────────────

@@ -86,8 +86,8 @@ class BashTool(Tool):
         out = p.stdout
         if p.stderr:
             out += "\n--- stderr ---\n" + p.stderr
-        if len(out) > 8000:
-            out = out[:8000] + f"\n... [truncated, total {len(out)} bytes]"
+        if len(out) > 32_000:
+            out = out[:32_000] + f"\n... [truncated, total {len(out)} bytes]"
         out = f"exit_code: {p.returncode}\n{out}"
         return ToolResult(output=out, error=p.returncode != 0)
 
@@ -116,6 +116,12 @@ def _python_error_hints(stderr: str) -> str:
         hints.append(
             "HINT: 'requests' is NOT installed. Use urllib.request or httpx instead."
         )
+    if "ModuleNotFoundError" in stderr and ("bs4" in stderr or "BeautifulSoup" in stderr):
+        hints.append(
+            "HINT: BeautifulSoup/bs4 is not a core dependency. Use stdlib "
+            "html.parser, regex over the cached HTML, or the html_inspect / "
+            "html_find / extractor_define tools instead."
+        )
     return "\n\n".join(hints)
 
 
@@ -123,14 +129,21 @@ class PythonExecTool(Tool):
     name = "python"
     description = (
         "Execute a Python 3 snippet in a fresh subprocess from the workdir. "
-        "Useful for transforms, parsing, or quick ad-hoc analysis. The "
-        "interpreter is the same one running the agent. Each call is "
-        "stateless — to persist data, write to a file in the workdir. "
-        "Print whatever you want shown back; output is truncated to 8 KB."
+        "First-class tool — use it freely for HTTP fetches, JSON parsing, "
+        "regex sweeps, custom row extraction, file munging, or any logic the "
+        "regex-spec tools can't express. The interpreter is the same one "
+        "running the agent, so stdlib + httpx + urllib + json + re + html + "
+        "csv + xml + zipfile + tarfile + gzip + pathlib are all available. "
+        "Each call is STATELESS — to persist data, write to a file in the "
+        "workdir (it'll be there next turn). Do not assume optional packages "
+        "like bs4/BeautifulSoup are installed; prefer stdlib parsing.\n\n"
+        "Print whatever you want shown back; output is truncated to 32 KB.\n\n"
+        "Default timeout is 180 seconds; raise it for long scrapes. Avoid "
+        "interactive prompts or infinite loops."
     )
     args_schema = {
         "code": {"type": "string", "description": "Python source code."},
-        "timeout": {"type": "integer", "default": 60, "description": "Seconds."},
+        "timeout": {"type": "integer", "default": 180, "description": "Seconds."},
     }
 
     def run(self, args: dict, state: "AgentState") -> ToolResult:
@@ -140,7 +153,7 @@ class PythonExecTool(Tool):
         err = _check_safety(code)
         if err:
             return ToolResult(output=f"REFUSED: {err}", error=True)
-        timeout = int(args.get("timeout") or 60)
+        timeout = int(args.get("timeout") or 180)
         with tempfile.NamedTemporaryFile(
             "w", suffix=".py", delete=False, dir=state.workdir
         ) as f:
@@ -164,8 +177,8 @@ class PythonExecTool(Tool):
         out = p.stdout
         if p.stderr:
             out += "\n--- stderr ---\n" + p.stderr
-        if len(out) > 8000:
-            out = out[:8000] + f"\n... [truncated, total {len(out)} bytes]"
+        if len(out) > 32_000:
+            out = out[:32_000] + f"\n... [truncated, total {len(out)} bytes]"
         hints = _python_error_hints(p.stderr) if p.returncode != 0 else ""
         out = f"exit_code: {p.returncode}\n{out}"
         if hints:

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -53,6 +54,12 @@ app = typer.Typer(add_completion=False, no_args_is_help=False,
                   help="gemma42 — scrape any website into a research-grade dataset.")
 console = Console()
 
+DEFAULT_AGENT_PROVIDER = os.getenv("GEMMA42_AGENT_PROVIDER") or "openrouter"
+DEFAULT_EXTRACTION_PROVIDER = os.getenv("GEMMA42_EXTRACTION_PROVIDER") or "openrouter"
+DEFAULT_EXTRACTION_MODEL = (
+    os.getenv("GEMMA42_EXTRACTION_MODEL") or "google/gemini-3.1-flash-lite"
+)
+
 
 # ── tool palette ────────────────────────────────────────────────────────────
 
@@ -80,7 +87,11 @@ TOOL_STYLES: dict[str, tuple[str, str]] = {
     "codebook_show":      ("👁 ", "yellow"),
     "codebook_edit":      ("✏ ", "yellow"),
     "codebook_test":      ("🧪", "yellow"),
-    "extract_items":      ("🧮", "bright_yellow"),
+    "extract_items":      ("🧬", "bright_yellow"),
+    "dataset_from_queue": ("➕", "green"),
+    "discover_assets":    ("🛰", "cyan"),
+    "set_plan":           ("🗺", "bold cyan"),
+    "show_plan":          ("🗺", "dim cyan"),
     "extract_structured": ("🧬", "yellow"),
     # dataset
     "dataset_append":     ("➕", "green"),
@@ -139,10 +150,21 @@ def _fmt_args_inline(args: Any) -> str:
         return _short(args, 240)
 
 
-def _print_banner(provider: str, model: str, workdir: Path) -> None:
+def _print_banner(
+    provider: str,
+    model: str,
+    workdir: Path,
+    *,
+    extraction_provider: str | None = None,
+    extraction_model: str | None = None,
+) -> None:
+    extraction_line = ""
+    if extraction_provider and extraction_model:
+        extraction_line = f"\n[dim]extract: {extraction_provider}/{extraction_model}[/dim]"
     text = (
         f"[bold cyan]gemma42[/bold cyan]  ·  text-to-dataset agent\n"
-        f"[dim]model:  {provider}/{model}[/dim]\n"
+        f"[dim]agent:  {provider}/{model}[/dim]"
+        f"{extraction_line}\n"
         f"[dim]workdir: {workdir}[/dim]"
     )
     console.print(Panel.fit(text, border_style="cyan", box=ROUNDED))
@@ -151,15 +173,10 @@ def _print_banner(provider: str, model: str, workdir: Path) -> None:
 # ── prompt parsing ──────────────────────────────────────────────────────────
 
 
-_COUNT_PATTERNS = [
-    re.compile(r"\btop\s+(\d{2,7})\b", re.IGNORECASE),
-    re.compile(
-        r"\b(\d{2,7})\s*(?:articles?|rows?|items?|records?|papers?|entries?|"
-        r"decisions?|sanctions?|cases?|posts?|pages?)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(r"\b(?:min|at least|atleast|>=?)\s*(\d{2,7})\b", re.IGNORECASE),
-]
+# The only fallback heuristic: the first 2–4 digit number in the prompt.
+# We don't try to be clever about it — the real intent parsing is done by
+# `_plan_with_llm` below.
+_FALLBACK_COUNT_RE = re.compile(r"\b(\d{2,4})\b")
 
 
 def _extract_url(prompt: str) -> str | None:
@@ -171,14 +188,112 @@ def _extract_url(prompt: str) -> str | None:
 
 
 def _extract_count(prompt: str) -> int | None:
-    for rx in _COUNT_PATTERNS:
-        m = rx.search(prompt)
-        if m:
-            try:
-                return int(m.group(1))
-            except ValueError:
-                continue
+    """Cheap heuristic fallback. The real planning is `_plan_with_llm`."""
+    m = _FALLBACK_COUNT_RE.search(prompt)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
     return None
+
+
+def _plan_with_llm(prompt: str, llm: Any) -> dict:
+    """One LLM call: turn a free-text user prompt into structured intent.
+
+    Returns: {count: int | null, target_fields: [str], source_url: str | null,
+              wants_codebook: bool, notes: str}
+
+    This is *not* hardcoded keyword matching. The LLM reads the goal and
+    decides — same way a junior data engineer would.
+    """
+    system = (
+        "You translate a user's plain-English scraping request into a "
+        "structured plan. The system has TWO layers:\n"
+        "  BRONZE (raw harvest)  — fields scraped directly from the page,\n"
+        "                          one observation per item (date, title, raw\n"
+        "                          decision text, organisation name, URL, …).\n"
+        "  SILVER (typed extract) — codebook variables a downstream model fills\n"
+        "                          from the raw text (booleans, enums, fine\n"
+        "                          amounts in EUR, derived categories, …).\n"
+        "Keep the two layers distinct in your plan.\n\n"
+        "Return ONE JSON object with these fields:\n"
+        '  count          : integer (how many records the user asked for, or null)\n'
+        '  target_fields  : SNAKE_CASE list of fields the BRONZE row must carry\n'
+        '                    (i.e. directly visible/scrapable evidence). DO NOT\n'
+        '                    include here variables that obviously need to be\n'
+        '                    parsed out of free text (those belong in the codebook\n'
+        '                    and live in SILVER). Naming: "n_comments" not\n'
+        '                    "number of comments", "published_date" not "publication\n'
+        '                    date". Only include fields that can be populated for\n'
+        '                    EVERY row. For optional facts phrased as "any X" or\n'
+        '                    "whether X", prefer a boolean `has_x`/`is_x` and put\n'
+        '                    it in the codebook seed, not in target_fields.\n'
+        '  source_url     : a URL if the user gave one, else null\n'
+        '  source_hint    : short text describing the source if no URL\n'
+        '  wants_codebook : boolean — DEFAULT TRUE. The goal of this system is to\n'
+        '                    turn webpages into stats/ML-ready datasets of TYPED\n'
+        '                    variables, not raw text. Set false ONLY when the\n'
+        '                    user explicitly asks for raw text/links with no\n'
+        '                    derived analysis.\n'
+        '  unique_field   : pick a field ONLY IF you can name an explicit primary\n'
+        '                    key in the source (an ID-shaped string: "doi",\n'
+        '                    "ticker", "post_id", "isbn", "ark_id", "arxiv_id").\n'
+        '                    DO NOT pick fields that can repeat across rows (dates,\n'
+        '                    names, titles, categories). When in doubt: null. The\n'
+        '                    system auto-synthesises a content-hash id when null.\n'
+        '  notes          : one short sentence with anything else important.\n\n'
+        "Quick discrimination test for each candidate field:\n"
+        "  • If a human could COPY-PASTE the value off the listing page → BRONZE\n"
+        "    (put in target_fields).\n"
+        "  • If the value requires reading the decision/abstract/body and INFERRING\n"
+        "    a class, count, flag, or amount → SILVER (do NOT put in target_fields;\n"
+        "    let the codebook design phase pick it up).\n"
+        "Output JSON only, no fences."
+    )
+    raw = llm.chat(
+        [{"role": "system", "content": system},
+         {"role": "user", "content": prompt}],
+        temperature=0.0,
+        response_format={"type": "json_object"},
+    )
+    from gemma42.swarm.base import parse_json_obj
+
+    obj = parse_json_obj(raw) or {}
+    # Normalize field names to snake_case (last-line defence if the model slips).
+    raw_fields = obj.get("target_fields") or []
+    norm_fields: list[str] = []
+    prompt_l = prompt.lower()
+    for f in raw_fields:
+        if not isinstance(f, str):
+            continue
+        s = f.strip().lower()
+        # "number of comments" → "n_comments"
+        s = re.sub(r"\bnumber\s+of\s+", "n_", s)
+        # spaces/hyphens/punctuation → underscores
+        s = re.sub(r"[^\w]+", "_", s).strip("_")
+        # Generic optional-fact rewrite: if the user said "any <field>" or
+        # "whether <field>", make the required field an explicit boolean
+        # instead of a nullable string. This is domain-agnostic.
+        phrase = re.escape(s.replace("_", " "))
+        optional_re = rf"\b(?:any|whether|if)\s+(?:an?\s+|the\s+)?{phrase}s?\b"
+        if (
+            s
+            and not s.startswith(("has_", "is_", "n_", "amount_", "pct_", "cat_", "dn_"))
+            and re.search(optional_re, prompt_l)
+        ):
+            s = f"has_{s}"
+        if s and s not in norm_fields:
+            norm_fields.append(s)
+    return {
+        "count":          obj.get("count"),
+        "target_fields":  norm_fields,
+        "source_url":     obj.get("source_url"),
+        "source_hint":    obj.get("source_hint"),
+        "wants_codebook": bool(obj.get("wants_codebook", True)),
+        "unique_field":   obj.get("unique_field"),
+        "notes":          obj.get("notes") or "",
+    }
 
 
 def _slugify_for_workdir(prompt: str, url: str | None) -> str:
@@ -220,6 +335,7 @@ class ActivityFeed:
         # current phase + dataset progress (rendered in the status bar)
         self.phase = ""
         self.rows = 0
+        self.extracted_rows = 0
         self.contracts: list[dict] = []
         # in-flight tool calls: index → start_ts
         self._inflight: list[float] = []
@@ -231,16 +347,132 @@ class ActivityFeed:
     def on_event(self, ev: dict[str, Any]) -> None:
         kind = ev.get("event")
         if kind == "phase":
-            self.phase = ev.get("phase", "")
+            phase = ev.get("phase", "")
+            if phase and phase != self.phase:
+                self.phase = phase
+                self._on_phase_change(phase)
+            else:
+                self.phase = phase
         elif kind == "llm_start":
             model = ev.get("model", "?")
-            self.set_thinking(f"calling [bold]{model}[/bold]…")
+            self.set_thinking(f"thinking with [bold]{model}[/bold]")
         elif kind == "turn":
             self._on_turn(ev)
+        elif kind == "reflection":
+            self._on_reflection(ev)
+        elif kind == "extract_start":
+            self._on_extract_start(ev)
+        elif kind == "extract_item_start":
+            self._on_extract_item_start(ev)
+        elif kind == "extract_item_done":
+            self._on_extract_item_done(ev)
+        elif kind == "extract_item_failed":
+            self._on_extract_item_failed(ev)
+        elif kind == "extract_done":
+            self._on_extract_done(ev)
         elif kind == "run_end":
             self.spinner_active = False
         elif kind == "aborted":
             self.spinner_active = False
+
+    # ── phase transition headers ──────────────────────────────────────────
+    _PHASE_LABELS = {
+        "DISCOVER_LISTING": ("🧭", "exploring the site"),
+        "ENUMERATE":        ("📚", "gathering the items"),
+        "DISCOVER_DETAIL":  ("🔬", "studying one item closely"),
+        "PROCESS":          ("⚗ ", "harvesting items + attachments"),
+        "CODEBOOK":         ("📓", "designing the codebook"),
+        "EXTRACT":          ("🧬", "extracting variables per item"),
+        "EXPORT":           ("📦", "writing the final dataset"),
+        "FINISH":           ("🏁", "wrapping up"),
+    }
+
+    def _on_phase_change(self, phase: str) -> None:
+        icon, label = self._PHASE_LABELS.get(phase, ("·", phase.lower()))
+        color = PHASE_COLORS.get(phase, "white")
+        text = Text.from_markup(
+            f"\n[{color}]{icon}  {phase}[/{color}]  [dim]· {label}[/dim]"
+        )
+        self.steps.append(text)
+        self._graduate(len(self.steps) - 1)
+
+    # ── extraction-progress handlers (Gemma-on-each-item loop) ────────────
+    _ext_total: int = 0
+    _ext_model: str = ""
+    _ext_done: int = 0
+    _ext_filled_avg: float = 0.0
+    _ext_failed: int = 0
+
+    def _on_extract_start(self, ev: dict[str, Any]) -> None:
+        self._ext_total = int(ev.get("total") or 0)
+        self._ext_model = str(ev.get("model") or "extractor")
+        self._ext_done = 0
+        self._ext_filled_avg = 0.0
+        self._ext_failed = 0
+        n_vars = int(ev.get("n_variables") or 0)
+        text = Text.from_markup(
+            f"  [bold bright_yellow]🧬 extracting variables[/bold bright_yellow]  "
+            f"[dim]· {self._ext_total} item(s) × {n_vars} variable(s)  "
+            f"· model: {self._ext_model}[/dim]"
+        )
+        self.steps.append(text)
+        self._graduate(len(self.steps) - 1)
+
+    def _on_extract_item_start(self, ev: dict[str, Any]) -> None:
+        i, total = ev.get("index", 0), ev.get("total", self._ext_total)
+        # Replace the spinner label with rolling per-item status.
+        avg_pct = (self._ext_filled_avg * 100) if self._ext_done else 0
+        self.set_thinking(
+            f"extracting item [bold]{i}/{total}[/bold] with "
+            f"[bold]{self._ext_model}[/bold]  · avg fill {avg_pct:.0f}%"
+        )
+
+    def _on_extract_item_done(self, ev: dict[str, Any]) -> None:
+        self._ext_done += 1
+        filled = int(ev.get("filled") or 0)
+        n_vars = max(1, int(ev.get("n_variables") or 1))
+        # Running average of fill ratio.
+        ratio = filled / n_vars
+        # Online mean update.
+        self._ext_filled_avg = (
+            (self._ext_filled_avg * (self._ext_done - 1)) + ratio
+        ) / self._ext_done
+        # Compact per-item line every 10 items (or at the end).
+        if self._ext_done % 10 == 0 or self._ext_done == self._ext_total:
+            pct = self._ext_done * 100 // max(1, self._ext_total)
+            text = Text.from_markup(
+                f"     [dim]→ {self._ext_done}/{self._ext_total} items "
+                f"({pct}%)  · avg fill {self._ext_filled_avg*100:.0f}%[/dim]"
+            )
+            self.steps.append(text)
+            self._graduate(len(self.steps) - 1)
+
+    def _on_extract_item_failed(self, ev: dict[str, Any]) -> None:
+        # Count silently — don't render errors in the live feed (the user
+        # asked us not to display them; they're still in failures.log).
+        self._ext_failed += 1
+
+    def _on_extract_done(self, ev: dict[str, Any]) -> None:
+        extracted = int(ev.get("extracted") or 0)
+        self.extracted_rows = max(self.extracted_rows, extracted)
+        text = Text.from_markup(
+            f"  [bold green]✓ extraction complete[/bold green]  "
+            f"[dim]· {extracted}/{self._ext_total} items processed  "
+            f"· avg fill {self._ext_filled_avg*100:.0f}%[/dim]"
+        )
+        self.steps.append(text)
+        self._graduate(len(self.steps) - 1)
+
+    def _on_reflection(self, ev: dict[str, Any]) -> None:
+        added = ev.get("added") or []
+        if not added:
+            return
+        bullets = "\n".join(f"  • {l}" for l in added)
+        text = Text.from_markup(
+            f"[bold yellow]📓 lesson{'s' if len(added) != 1 else ''} learned[/bold yellow]\n{bullets}",
+        )
+        self.steps.append(text)
+        self._graduate(len(self.steps) - 1)
 
     def _on_turn(self, ev: dict[str, Any]) -> None:
         turn = ev.get("turn", 0)
@@ -289,18 +521,23 @@ class ActivityFeed:
         m, s = divmod(elapsed, 60)
         phase_color = PHASE_COLORS.get(self.phase, "white")
         phase_part = f"[{phase_color}]{self.phase or '—'}[/{phase_color}]"
-        # show first failing contract for context
-        failing = next((c for c in self.contracts if not c.get("ok")), None)
+        # Show contract progress as a count, not as a red failure label.
         c_part = ""
-        if failing:
+        if self.contracts:
+            ok_count = sum(1 for c in self.contracts if c.get("ok"))
+            total = len(self.contracts)
+            color = "green" if ok_count == total else "yellow"
             c_part = (
                 f"  [dim]·[/dim]  "
-                f"[red]{failing['name']}[/red] [dim]{failing.get('detail','')}[/dim]"
+                f"contracts [bold {color}]{ok_count}/{total}[/bold {color}]"
             )
+        rows_part = f"raw {self.rows}"
+        if self.extracted_rows:
+            rows_part += f"  [dim]·[/dim]  extracted {self.extracted_rows}"
         return Text.from_markup(
             f"  phase: {phase_part}  [dim]·[/dim]  "
             f"step {self.step_count}  [dim]·[/dim]  "
-            f"rows {self.rows}  [dim]·[/dim]  "
+            f"{rows_part}  [dim]·[/dim]  "
             f"{m}m{s:02d}s" + c_part
         )
 
@@ -341,22 +578,26 @@ class ActivityFeed:
         )
 
     def _result_renderable(self, name: str, content: str, is_error: bool, elapsed_ms: float) -> Any:
-        # extract a useful one-line summary
-        summary = self._inline_summary(name, content)
+        # Errors are tracked silently in failures.log; the live feed only
+        # shows a muted "retrying…" hint so the user isn't drowning in red.
         ms = f"  · {elapsed_ms / 1000.0:.1f}s" if elapsed_ms else ""
-        glyph = "✗" if is_error else "↳"
-        style = "bold red" if is_error else "dim"
-        # multi-line / longer summaries get a tiny panel
+        if is_error:
+            return Text.assemble(
+                ("    ↻ ", "dim yellow"),
+                (f"{name} retrying with a different approach", "dim"),
+                (ms, "dim"),
+            )
+        summary = self._inline_summary(name, content)
         if len(summary) > 180 or "\n" in summary:
             return Panel(
                 Text(summary[:1200], style="white", overflow="fold"),
-                border_style="red" if is_error else "dim",
+                border_style="dim",
                 box=SIMPLE,
                 padding=(0, 1),
             )
         return Text.assemble(
-            ("    " + glyph + " ", style),
-            (summary, "red" if is_error else "white"),
+            ("    ↳ ", "dim"),
+            (summary, "white"),
             (ms, "dim"),
         )
 
@@ -376,7 +617,7 @@ class ActivityFeed:
             "process_queue":     ["appended", "remaining_in_queue"],
             "dataset_append":    ["added", "total_rows_now"],
             "dataset_stats":     ["rows"],
-            "extract_items":     ["processed", "errors"],
+            "extract_items":     ["processed"],
             "extract_text":      ["text_chars", "n_pages"],
             "save_attachment":   ["attachment_path", "text_chars"],
             "codebook_propose":  ["variables", "type breakdown"],
@@ -422,6 +663,8 @@ def _run_with_live_feed(
     unique_field: str | None,
     provider: str,
     model: str | None,
+    extraction_provider: str,
+    extraction_model: str | None,
     max_turns: int,
     want_codebook: bool,
 ) -> Any:
@@ -430,7 +673,14 @@ def _run_with_live_feed(
     workdir.mkdir(parents=True, exist_ok=True)
 
     llm = make_llm(provider, model=model)
-    _print_banner(provider, llm.config.model, workdir)
+    extraction_llm = make_llm(extraction_provider, model=extraction_model)
+    _print_banner(
+        provider,
+        llm.config.model,
+        workdir,
+        extraction_provider=extraction_provider,
+        extraction_model=extraction_llm.config.model,
+    )
 
     contracts: list = []
     if min_rows > 0:
@@ -448,6 +698,8 @@ def _run_with_live_feed(
     decided.add_row("goal", _short(goal, 220))
     decided.add_row("min rows", str(min_rows) if min_rows else "—")
     decided.add_row("workdir", str(workdir))
+    decided.add_row("agent model", f"{provider}/{llm.config.model}")
+    decided.add_row("extract model", f"{extraction_provider}/{extraction_llm.config.model}")
     decided.add_row("codebook", "yes (auto-design 20–60 typed vars)" if want_codebook else "no")
     console.print(Panel(decided, title="run plan", border_style="cyan", box=SIMPLE))
     console.print(Rule(style="dim cyan"))
@@ -469,8 +721,10 @@ def _run_with_live_feed(
                 contracts=contracts,
                 workdir=workdir,
                 llm=llm,
+                extraction_llm=extraction_llm,
                 unique_key=unique_field or None,
                 config=cfg,
+                extra_memory={"wants_codebook": bool(want_codebook)},
             )
         finally:
             feed.stop_spinner()
@@ -493,6 +747,11 @@ def _print_summary(result: Any) -> None:
     t.add_row("trace", result.trace_log)
     if hasattr(result, "trace_jsonl"):
         t.add_row("trace.jsonl", result.trace_jsonl)
+    # Show failure-log paths if anything failed.
+    workdir = Path(result.dataset_path).parent
+    fail_log = workdir / "failures.log"
+    if fail_log.exists() and fail_log.stat().st_size > 0:
+        t.add_row("failures.log", str(fail_log))
     console.print(Panel(t, title="run result", border_style=color, box=ROUNDED))
     if result.contracts:
         ct = Table(title="contracts", header_style="bold cyan", box=SIMPLE)
@@ -517,10 +776,12 @@ def _print_summary(result: Any) -> None:
                 border_style="bright_green",
                 box=ROUNDED,
             ))
-            console.print(Text(
-                f"  load it: [white]pd.read_parquet('{export_dir}/<name>.parquet')[/white]  "
-                f"·  push: [white]gemma42 hf-push <repo-id> --workdir {workdir}[/white]",
-                style="dim",
+            parquet = next((f for f in files if f.suffix == ".parquet"), None)
+            dataset_jsonl = Path(result.dataset_path)
+            load_path = parquet or (export_dir / "<name>.parquet")
+            console.print(Text.from_markup(
+                f"  [dim]load it:[/dim] [white]pd.read_parquet('{load_path}')[/white]  "
+                f"[dim]· push:[/dim] [white]gemma42 export-hf {dataset_jsonl} --repo-id <repo-id>[/white]"
             ))
 
 
@@ -534,24 +795,58 @@ def _orchestrate(
     workdir: Path | None,
     provider: str,
     model: str | None,
+    extraction_provider: str,
+    extraction_model: str | None,
     max_turns: int,
     no_codebook: bool,
     push: str | None,
     public: bool,
 ) -> Any:
-    """One-call entry point: parse the prompt, derive defaults, run."""
+    """One-call entry point: parse the prompt with the LLM, run."""
     prompt = prompt.strip()
     url = _extract_url(prompt)
-    parsed_count = _extract_count(prompt)
-    target_rows = rows if rows is not None else (parsed_count or 50)
+    fallback_count = _extract_count(prompt)
+
+    # Ask the LLM to parse the prompt — no hardcoded keyword lists.
+    llm_for_plan = make_llm(provider, model=model)
+    plan: dict = {}
+    try:
+        plan = _plan_with_llm(prompt, llm_for_plan)
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[dim]planner failed: {e}; falling back to heuristics[/dim]")
+    if plan.get("source_url") and not url:
+        url = plan["source_url"]
+
+    target_rows = (
+        rows
+        if rows is not None
+        else (plan.get("count") if isinstance(plan.get("count"), int)
+              else (fallback_count or 30))
+    )
+    target_fields = plan.get("target_fields") or []
+    unique_field = plan.get("unique_field")
+    wants_codebook = (not no_codebook) and plan.get("wants_codebook", True)
 
     if workdir is None:
         workdir = _auto_workdir(prompt, url, Path("./runs"))
 
-    # build the agent's goal: the user's prompt + a structured-data nudge
-    # so the agent enters the codebook phase after harvesting.
+    # Tell the user what we understood — visibility, not magic.
+    plan_text = (
+        f"  count target:   {target_rows}\n"
+        f"  fields:         {target_fields or '(any)'}\n"
+        f"  source URL:     {url or plan.get('source_hint') or '(agent picks)'}\n"
+        f"  codebook phase: {'yes' if wants_codebook else 'no'}\n"
+        + (f"  notes:          {plan.get('notes')}\n" if plan.get('notes') else "")
+    )
+    console.print(Panel(plan_text, title="what I understood", border_style="cyan", box=SIMPLE))
+
+    # Build the agent's goal: the user's prompt + the planner's structured intent.
     goal_lines = [prompt]
-    if not no_codebook:
+    if target_fields:
+        goal_lines.append(
+            f"\nTarget output fields: {', '.join(target_fields)}."
+        )
+    if wants_codebook:
         goal_lines.append(
             "\nAfter the harvest phase, automatically design a codebook of "
             "20–60 typed variables (booleans, integers, floats, enums, "
@@ -569,12 +864,14 @@ def _orchestrate(
         goal="\n".join(goal_lines),
         workdir=workdir,
         min_rows=target_rows,
-        required_fields=[],
-        unique_field=None,
+        required_fields=target_fields,
+        unique_field=unique_field,
         provider=provider,
         model=model,
+        extraction_provider=extraction_provider,
+        extraction_model=extraction_model,
         max_turns=max_turns,
-        want_codebook=not no_codebook,
+        want_codebook=wants_codebook,
     )
     return result
 
@@ -597,10 +894,19 @@ def ask_cmd(
         help="Working directory (auto-named under ./runs/ if omitted).",
     ),
     provider: str = typer.Option(
-        "together", "--provider",
-        help=f"LLM provider: {', '.join(list_providers())}",
+        None, "--provider",
+        help=(f"LLM provider: {', '.join(list_providers())}. "
+              "Default: openrouter for agentic discovery/recon."),
     ),
     model: str = typer.Option(None, "--model", "-m"),
+    extraction_provider: str = typer.Option(
+        None, "--extract-provider",
+        help="Provider used only for schema-constrained extraction. Default: ollama.",
+    ),
+    extraction_model: str = typer.Option(
+        None, "--extract-model",
+        help="Model used only for schema-constrained extraction. Default: gemma4:latest.",
+    ),
     max_turns: int = typer.Option(120, "--max-turns"),
     no_codebook: bool = typer.Option(
         False, "--no-codebook",
@@ -608,7 +914,7 @@ def ask_cmd(
     ),
     push: str = typer.Option(
         None, "--push",
-        help="Hugging Face repo id to push the final dataset to (e.g. you/cnil-sanctions).",
+        help="Hugging Face repo id to push the final dataset to (e.g. you/my-dataset).",
     ),
     public: bool = typer.Option(
         False, "--public",
@@ -616,8 +922,12 @@ def ask_cmd(
     ),
 ):
     """One-shot prompt-first run. The agent extracts URL+count from the prompt."""
+    provider = provider or DEFAULT_AGENT_PROVIDER
+    extraction_provider = extraction_provider or DEFAULT_EXTRACTION_PROVIDER
+    extraction_model = extraction_model or DEFAULT_EXTRACTION_MODEL
     _orchestrate(
         prompt, rows=rows, workdir=workdir, provider=provider, model=model,
+        extraction_provider=extraction_provider, extraction_model=extraction_model,
         max_turns=max_turns, no_codebook=no_codebook, push=push, public=public,
     )
 
@@ -861,6 +1171,8 @@ class REPL:
             workdir=None if self.last_workdir is None else None,  # auto-name each run
             provider=self.provider,
             model=self.model,
+            extraction_provider=DEFAULT_EXTRACTION_PROVIDER,
+            extraction_model=DEFAULT_EXTRACTION_MODEL,
             max_turns=120,
             no_codebook=False,
             push=None,
@@ -898,10 +1210,11 @@ class REPL:
 
 @app.command("chat")
 def chat_cmd(
-    provider: str = typer.Option("together", "--provider"),
+    provider: str = typer.Option(None, "--provider"),
     model: str = typer.Option(None, "--model", "-m"),
 ) -> None:
     """Interactive Claude-Code-style shell. Type freely, /help for commands."""
+    provider = provider or DEFAULT_AGENT_PROVIDER
     repl = REPL(provider=provider, model=model)
     repl.show_banner()
     while True:
@@ -940,16 +1253,29 @@ def run_cmd(
         None, help="JSON file containing a JSON-Schema object that every row must satisfy."
     ),
     provider: str = typer.Option(
-        "together",
-        help=f"LLM provider. One of: {', '.join(list_providers())}.",
+        None,
+        help=f"LLM provider. One of: {', '.join(list_providers())}. Default: auto.",
     ),
     model: str = typer.Option("", help="Model id. Empty = provider default."),
     base_url: str = typer.Option("", help="Override the provider's base URL."),
+    extraction_provider: str = typer.Option(
+        None,
+        "--extract-provider",
+        help="Provider used only for schema-constrained extraction. Default: ollama.",
+    ),
+    extraction_model: str = typer.Option(
+        None,
+        "--extract-model",
+        help="Model used only for schema-constrained extraction. Default: gemma4:latest.",
+    ),
     max_turns: int = typer.Option(120, help="Hard limit on agent turns."),
     no_codebook: bool = typer.Option(False, help="Skip the codebook contract."),
     live: bool = typer.Option(True, "--live/--no-live", help="Use the live Rich feed."),
 ):
     """Power-user run with explicit flags. Use `ask` for the friendly prompt-first form."""
+    provider = provider or DEFAULT_AGENT_PROVIDER
+    extraction_provider = extraction_provider or DEFAULT_EXTRACTION_PROVIDER
+    extraction_model = extraction_model or DEFAULT_EXTRACTION_MODEL
     if live:
         # Route through the live-feed orchestrator using the explicit goal.
         contracts_kwargs = {
@@ -957,6 +1283,8 @@ def run_cmd(
             "workdir": workdir,
             "provider": provider,
             "model": model or None,
+            "extraction_provider": extraction_provider,
+            "extraction_model": extraction_model,
             "max_turns": max_turns,
             "no_codebook": no_codebook,
             "push": None,
@@ -979,11 +1307,13 @@ def run_cmd(
         contracts.append(CodebookContract(min_variables=20))
     schema = json.loads(Path(schema_file).read_text()) if schema_file else None
     llm = make_llm(provider, model=model or None, base_url=base_url or None)
+    extraction_llm = make_llm(extraction_provider, model=extraction_model or None)
     result = run_agent(
         goal=goal,
         contracts=contracts,
         workdir=workdir,
         llm=llm,
+        extraction_llm=extraction_llm,
         dataset_schema=schema,
         unique_key=unique_field.strip() or None,
         config=AgentConfig(max_turns=max_turns, verbose=True),
@@ -1007,7 +1337,7 @@ def providers_cmd() -> None:
 @app.command("export-hf")
 def export_hf_cmd(
     dataset: Path = typer.Argument(..., help="Path to dataset.jsonl produced by a run."),
-    repo_id: str = typer.Option(..., help="Hugging Face dataset repo (e.g. yourname/cnil-sanctions)."),
+    repo_id: str = typer.Option(..., help="Hugging Face dataset repo (e.g. yourname/my-dataset)."),
     private: bool = typer.Option(True),
 ):
     """Push a JSONL dataset to the Hugging Face Hub."""
@@ -1048,7 +1378,8 @@ def _route_default_to_ask(argv: list[str]) -> list[str]:
     # before that as the prompt.
     ask_opts = {
         "--rows", "-n", "--workdir", "-w", "--provider", "--model", "-m",
-        "--max-turns", "--no-codebook", "--push", "--public",
+        "--extract-provider", "--extract-model", "--max-turns", "--no-codebook",
+        "--push", "--public",
     }
     msg_parts: list[str] = []
     tail: list[str] = []

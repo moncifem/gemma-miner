@@ -44,6 +44,40 @@ class MinRowsContract(Contract):
         return False, f"need more rows ({n}/{self.min_rows})"
 
 
+def _field_variants(name: str) -> list[str]:
+    """Acceptable variants for a required field name.
+
+    Lets the contract tolerate small naming drift between what the user said
+    in the prompt and what the model named the column. e.g. "comments" /
+    "n_comments" / "num_comments" / "comments_count" all map to the same
+    semantic field.
+    """
+    import re as _re
+
+    base = name.strip()
+    if not base:
+        return [name]
+    snake = _re.sub(r"[^\w]+", "_", base.lower()).strip("_")
+    variants: set[str] = {base, snake, snake.replace("__", "_")}
+
+    # Strip count-like prefixes/suffixes to find the bare noun.
+    bare = snake
+    bare = _re.sub(r"^(?:n_|num_|number_of_|nb_|count_of_|amount_of_)", "", bare)
+    bare = _re.sub(r"_(?:count|total|amount|num|number)$", "", bare)
+    bare = bare.strip("_") or snake
+
+    # Generate the family.
+    for stem in {snake, bare}:
+        if not stem:
+            continue
+        variants.update({
+            stem,
+            f"n_{stem}", f"num_{stem}", f"number_of_{stem}", f"nb_{stem}",
+            f"{stem}_count", f"{stem}_total", f"{stem}_num", f"{stem}_number",
+        })
+    return [v for v in variants if v]
+
+
 @dataclass
 class FieldsContract(Contract):
     """Every row in the dataset must have these fields populated (non-null)."""
@@ -56,10 +90,13 @@ class FieldsContract(Contract):
         return f"Every row must have non-null fields: {', '.join(self.required_fields)}."
 
     def check(self, dataset: Any) -> tuple[bool, str]:
+        # For each required field, accept ANY of its naming variants.
         missing: dict[str, int] = {}
-        for row in dataset.rows() if hasattr(dataset, "rows") else dataset:
-            for f in self.required_fields:
-                if row.get(f) in (None, ""):
+        rows = dataset.rows() if hasattr(dataset, "rows") else list(dataset)
+        for f in self.required_fields:
+            variants = _field_variants(f)
+            for row in rows:
+                if not any(row.get(v) not in (None, "") for v in variants):
                     missing[f] = missing.get(f, 0) + 1
         if not missing:
             return True, "OK (all rows have required fields)"

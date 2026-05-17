@@ -40,6 +40,19 @@ class VariableSpec:
     required: bool = False
     extraction_hint: str | None = None         # extra LLM guidance per variable
 
+    # Living-codebook upgrades:
+    # - Negative examples: "this is NOT a valid value" — improves extraction
+    #   sharply on small models because they often confuse adjacent concepts.
+    negative_examples: list[str] = field(default_factory=list)
+    # - Positive examples (verbatim quotes from the source). Optional anchors.
+    positive_examples: list[str] = field(default_factory=list)
+    # - Pass: variables can be flagged as pass-2 (only extract them when all
+    #   pass-1 variables are already filled, with pass-1 context available).
+    pass_: int = 1                              # 1 = first read, 2 = re-read with context
+    # - Adversarial scars: previous adversary critiques that the variable has
+    #   already survived. Used to remember "we already addressed X".
+    adversary_notes: list[str] = field(default_factory=list)
+
     def validate(self) -> list[str]:
         errs: list[str] = []
         if not self.name or not isinstance(self.name, str):
@@ -77,6 +90,10 @@ class VariableSpec:
             descr = f"{descr} (min {self.min_value})"
         if self.max_value is not None:
             descr = f"{descr} (max {self.max_value})"
+        if self.positive_examples:
+            descr = f"{descr} EXAMPLES: " + " | ".join(self.positive_examples[:3])
+        if self.negative_examples:
+            descr = f"{descr} NOT: " + " | ".join(self.negative_examples[:3])
         schema["description"] = descr
         return schema
 
@@ -95,9 +112,14 @@ class Codebook:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Codebook":
+        import dataclasses as _dc
+        allowed = {f.name for f in _dc.fields(VariableSpec)}
         vars_ = []
         for v in d.get("variables", []):
-            vars_.append(VariableSpec(**v))
+            # Drop any unknown keys (curator/adversary may attach internal
+            # `_adversary_note` or other scratch fields). Keep what's valid.
+            clean = {k: val for k, val in v.items() if k in allowed}
+            vars_.append(VariableSpec(**clean))
         cb = cls(
             name=d.get("name", "codebook"),
             description=d.get("description", ""),
@@ -191,3 +213,27 @@ class Codebook:
             if v.type in ("integer", "float", "boolean")
         )
         return n / len(self.variables)
+
+    # ── two-pass extraction ────────────────────────────────────────────────
+
+    def pass1_variables(self) -> list[VariableSpec]:
+        return [v for v in self.variables if (v.pass_ or 1) == 1]
+
+    def pass2_variables(self) -> list[VariableSpec]:
+        return [v for v in self.variables if (v.pass_ or 1) == 2]
+
+    def to_json_schema_for_pass(self, pass_n: int) -> dict:
+        """JSON Schema covering only variables flagged for this pass."""
+        if pass_n == 1:
+            vars_ = self.pass1_variables()
+        else:
+            vars_ = self.pass2_variables()
+        properties = {v.name: v.to_json_schema() for v in vars_}
+        required = [v.name for v in vars_ if v.required]
+        return {
+            "type": "object",
+            "title": f"{self.name}_pass{pass_n}",
+            "description": self.description,
+            "properties": properties,
+            "required": required,
+        }

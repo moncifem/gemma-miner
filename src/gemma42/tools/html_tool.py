@@ -12,7 +12,7 @@ import re
 from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from gemma42.tools.base import Tool, ToolResult
 
@@ -109,32 +109,136 @@ def _load_or_raise(path_or_text: str, state: "AgentState") -> str:
     return result
 
 
-def _resolve_source_arg(state: "AgentState", args: dict) -> tuple[str | None, str | None]:
-    """Resolve the `source` arg, optionally fetching a URL on the fly.
+def _unwrap_file_ref(v: Any) -> Any:
+    """If `v` is a `{"$file": "path"}` reference, return the path (not its content).
 
-    Returns (source_string, error_message). If `url` is given and there is no
-    cached file for it yet, the caller should fetch it via http_get first.
+    The model often wraps path-typed args in $file references it sees mentioned
+    in the prompt. For tools that take a PATH (not file content), we just need
+    the path string itself.
     """
-    src = args.get("source") or args.get("path") or args.get("file") or args.get("html")
-    if src:
-        return src, None
-    url = args.get("url")
-    if url:
-        # Look for a cache hit so we can use it transparently.
-        import hashlib
+    if isinstance(v, dict) and "$file" in v and isinstance(v["$file"], str):
+        return v["$file"]
+    return v
 
-        slug = hashlib.sha1(url.encode()).hexdigest()[:12]
-        cache_dir = Path(state.workdir) / "cache"
-        if cache_dir.exists():
-            for existing in cache_dir.glob(f"{slug}.*"):
-                return str(existing.resolve()), None
+
+def _cache_lookup_by_url(state: "AgentState", url: str) -> str | None:
+    """Return the absolute cache path for `url` if it's been fetched."""
+    import hashlib
+    slug = hashlib.sha1(url.encode()).hexdigest()[:12]
+    cache_dir = Path(state.workdir) / "cache"
+    if cache_dir.exists():
+        for existing in cache_dir.glob(f"{slug}.*"):
+            return str(existing.resolve())
+    return None
+
+
+def _try_resolve_path_like(state: "AgentState", val: str) -> str | None:
+    """Liberal path resolution.
+
+    Accept anything that vaguely looks like a path or cache reference and
+    try every plausible location:
+      - the value itself, if it's an existing file
+      - <workdir>/<value>
+      - <workdir>/cache/<basename>
+      - <workdir>/cache/<value>
+      - just the basename inside cache (e.g. "cache/abc.html" → "cache/abc.html")
+    Returns the absolute path string if any candidate exists.
+    """
+    if not isinstance(val, str) or not val:
+        return None
+    workdir = Path(state.workdir)
+    candidates: list[Path] = []
+    try:
+        p = Path(val)
+    except (OSError, ValueError):
+        return None
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        candidates.extend([
+            workdir / p,
+            workdir / "cache" / p.name,
+            workdir / "cache" / p,
+        ])
+        # If the value starts with "cache/", also try without the prefix.
+        if val.startswith("cache/"):
+            candidates.append(workdir / val[len("cache/"):])
+    for cand in candidates:
+        try:
+            if cand.exists() and cand.is_file():
+                return str(cand.resolve())
+        except OSError:
+            continue
+    return None
+
+
+def _resolve_source_arg(state: "AgentState", args: dict) -> tuple[str | None, str | None]:
+    """Resolve the `source` arg.
+
+    LIBERAL POLICY: collect candidate strings from EVERY plausible arg name
+    (source, path, file, html, url) and for each, try in order:
+      1. raw HTML (starts with `<`)
+      2. real URL (http(s)://…) → look up cache
+      3. path-like → resolve under workdir, workdir/cache, etc.
+    The first one that resolves wins. Only error out if nothing resolves.
+    This protects the agent against the constant mistake of passing a path
+    in `url=` (or a URL in `source=`, or `cache/foo.html`, etc.).
+    """
+    # Collect candidates in priority order.
+    arg_names = ("source", "path", "file", "html", "url")
+    candidates: list[tuple[str, str]] = []  # (arg_name, value)
+    for k in arg_names:
+        v = _unwrap_file_ref(args.get(k))
+        if v is None:
+            continue
+        if not isinstance(v, str):
+            return None, (
+                f"ERROR: '{k}' must be a string path, URL, or raw HTML; got "
+                f"{type(v).__name__}. If you meant a path, pass just the string."
+            )
+        if v:
+            candidates.append((k, v))
+
+    if not candidates:
         return None, (
-            f"ERROR: a 'url' was given but no cached body exists. "
-            f"Call http_get(url='{url}') first; then this tool can use the cache_path."
+            "ERROR: pass `source` (file path or raw HTML) or `url` (a real URL "
+            "already fetched via http_get)."
         )
+
+    unresolved_urls: list[str] = []
+    for name, v in candidates:
+        # 1. raw HTML
+        if "<" in v[:8] or "\n" in v:
+            return v, None
+        # 2. real URL
+        if re.match(r"^https?://", v):
+            cached = _cache_lookup_by_url(state, v)
+            if cached:
+                return cached, None
+            unresolved_urls.append(v)
+            continue
+        # 3. path-like — try the filesystem (workdir, cache, …)
+        resolved = _try_resolve_path_like(state, v)
+        if resolved:
+            return resolved, None
+        # 4. fallback: hash-as-URL (in case the agent passed a real URL
+        # that happens not to start with http://)
+        cached = _cache_lookup_by_url(state, v)
+        if cached:
+            return cached, None
+
+    if unresolved_urls:
+        return None, (
+            f"ERROR: '{unresolved_urls[0]}' has not been fetched yet. "
+            f"Call http_get(url='{unresolved_urls[0]}') first; this tool will "
+            "then load it from the cache automatically."
+        )
+    sample = candidates[0][1]
     return None, (
-        "ERROR: 'source' is required (file path, cache path, or raw HTML). "
-        "Or pass 'url' but only AFTER calling http_get on it."
+        f"ERROR: could not resolve {sample!r} as a file path under {state.workdir!r}, "
+        "as a cached URL, or as raw HTML. "
+        "If it is a URL, call http_get first. If it is a cached file, pass the "
+        "absolute cache_path that http_get returned."
     )
 
 
@@ -245,7 +349,7 @@ def _find_sample_block(html: str, classes: Counter) -> tuple[str, str] | None:
             continue
         # Capture a chunk starting at the opening tag.
         start = m.start()
-        end = min(len(html), start + 2500)
+        end = min(len(html), start + 30_000)
         # Try to end at a clean tag boundary.
         last_close = html.rfind(">", start, end)
         if last_close > start:
@@ -258,6 +362,108 @@ def _strip_tags(s: str) -> str:
     s = re.sub(r"<[^>]+>", " ", s)
     s = htmllib.unescape(s)
     return re.sub(r"\s+", " ", s).strip()
+
+
+class HtmlFindTool(Tool):
+    name = "html_find"
+    description = (
+        "Find HTML elements by a CLASS TOKEN (no regex required). Pass "
+        "`source` (file path or HTML) and `class_token` (e.g. 'athing' or "
+        "'views-row'); the tool returns the first N elements whose `class=` "
+        "attribute contains that token (correctly handling multi-class "
+        "attributes like `class=\"athing submission\"`). Optional: "
+        "`tag` (default any) limits to a specific tag. Use this when the "
+        "exact-class regex isn't matching — `html_find(class_token='athing')` "
+        "Just Works."
+    )
+    args_schema = {
+        "source":      {"type": "string"},
+        "url":         {"type": "string"},
+        "class_token": {"type": "string"},
+        "tag":         {"type": "string", "description": "Optional: limit to a tag like 'tr', 'div', 'article'."},
+        "limit":       {"type": "integer", "default": 5},
+    }
+
+    def run(self, args: dict, state: "AgentState") -> ToolResult:
+        src, err = _resolve_source_arg(state, args)
+        if err:
+            return ToolResult(output=err, error=True)
+        cls = (
+            args.get("class_token")
+            or args.get("class")
+            or args.get("class_name")
+            or args.get("cls")
+            or args.get("token")
+            or ""
+        )
+        # Also accept CSS-style selectors like "tr.athing" — extract the class.
+        sel = args.get("selector") or args.get("css")
+        if not cls and isinstance(sel, str):
+            # Take the LAST class in a comma list (model usually intends the
+            # most-specific). e.g. "tr.athing, tr.source" → "athing".
+            sel_first = sel.split(",")[0].strip()
+            m = re.search(r"\.([\w-]+)", sel_first)
+            if m:
+                cls = m.group(1)
+                # Also infer tag if present
+                tag_m = re.match(r"^([a-zA-Z][\w-]*)", sel_first)
+                if tag_m and not args.get("tag"):
+                    args["tag"] = tag_m.group(1)
+        if not cls:
+            return ToolResult(
+                output=(
+                    "ERROR: pass `class_token` (e.g. 'athing') OR `selector` "
+                    "(e.g. 'tr.athing'). The tool finds repeating elements by "
+                    "a CSS class TOKEN — no full CSS selector engine."
+                ),
+                error=True,
+            )
+        limit = int(args.get("limit") or 5)
+        tag = (args.get("tag") or r"\w+").strip()
+        try:
+            html = _load_or_raise(src, state)
+        except _SourceNotFoundError as e:
+            return ToolResult(output=f"ERROR: {e}", error=True)
+
+        # Match elements: <tag ... class="...token..."...> ... </tag>
+        # We don't try to balance nested same-tag elements perfectly —
+        # for repeating elements (tr/div/li) we want the closing of the
+        # OUTER instance, but a non-greedy match returns the closest closing
+        # tag which is the right answer for >95% of real-world cases.
+        pattern = (
+            rf'<({tag})\b[^>]*\bclass="[^"]*\b{re.escape(cls)}\b[^"]*"[^>]*>'
+            r'(.*?)'
+            rf'</\1>'
+        )
+        try:
+            rx = re.compile(pattern, re.DOTALL | re.IGNORECASE)
+        except re.error as e:
+            return ToolResult(output=f"ERROR: regex compile: {e}", error=True)
+        matches = list(rx.finditer(html))
+        if not matches:
+            # Fall back to just counting class hits — useful diagnosis
+            count = len(re.findall(rf'class="[^"]*\b{re.escape(cls)}\b[^"]*"', html))
+            return ToolResult(output=(
+                f"0 elements with class token '{cls}' and tag '{tag}'.\n"
+                f"  Class-token total hits in the page: {count}\n"
+                "  TIP: maybe try a different tag, or call html_inspect to "
+                "see what's available."
+            ), artifact={"matches": 0})
+        sample = matches[:limit]
+        out = [f"total_matches: {len(matches)}", f"tag: {tag}  class_token: {cls}"]
+        for i, m in enumerate(sample):
+            block = m.group(0)
+            if len(block) > 1200:
+                block = block[:1200] + "…"
+            out.append(f"--- match {i} ({len(m.group(0))} chars) ---")
+            out.append(block)
+        # Suggest a row_pattern the agent can drop into extractor_define.
+        out.append("")
+        out.append(
+            f"You can use this regex as your row_pattern: "
+            f'`<{tag}\\b[^>]*\\bclass="[^"]*\\b{re.escape(cls)}\\b[^"]*"[^>]*>(.*?)</{tag}>`'
+        )
+        return ToolResult(output="\n".join(out), artifact={"matches": len(matches)})
 
 
 class HtmlExtractTool(Tool):

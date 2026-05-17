@@ -14,6 +14,7 @@ the model sees just one big tool call, not 100 turns.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -75,7 +76,13 @@ def extract_one_item(
     max_chars: int = 24000,
     temperature: float = 0.0,
 ) -> tuple[dict, dict[str, str]]:
-    """Run one extraction on `row`. Returns (merged_row, coercion_warnings)."""
+    """Run one extraction on `row`. Returns (typed_row, coercion_warnings).
+
+    The returned `typed_row` contains ONLY the `id` (join key) and the
+    codebook columns — NOT the raw harvest fields. Bronze (raw harvest)
+    and silver (typed variables) are stored as separate datasets joined
+    by `id`, so the row count is meaningful in both layers.
+    """
     text = _row_text(row, str(workdir))
     if not text:
         raise ValueError("no text content available for this item")
@@ -102,8 +109,8 @@ def extract_one_item(
     if obj is None:
         raise ValueError(f"could not parse JSON object from model output (first 400 chars):\n{raw[:400]}")
     coerced, warnings = coerce_row(obj, codebook.variables)
-    # Merge: keep all existing row metadata, then overlay the structured fields.
-    merged = dict(row)
+    # Typed-only row: just the id (join key) + codebook columns. No raw fields.
+    merged: dict = {"id": row.get("id")}
     for k, v in coerced.items():
         merged[k] = v
     return merged, warnings
@@ -112,25 +119,32 @@ def extract_one_item(
 class ExtractItemsTool(Tool):
     name = "extract_items"
     description = (
-        "Apply the current codebook to EVERY item in the dataset (or a "
-        "subset). For each item we read its source text, send the codebook's "
-        "JSON Schema + text to the LLM, coerce every returned value to the "
-        "declared type, and UPSERT the merged row back into the dataset "
-        "(keyed by `id`). One LLM call per item; one tool call handles the "
-        "whole corpus.\n\n"
-        "Recommended workflow:\n"
-        "  1. After harvesting, run `codebook_propose` → `codebook_test` → "
-        "iterate until you're happy.\n"
-        "  2. Run `extract_items(limit=...)` to fill the codebook columns "
-        "for every item. Watch the per-variable coverage in the output.\n"
-        "  3. Run `dataset_export` to produce parquet + codebook.md."
+        "Apply the current codebook to items in the dataset. For each item we "
+        "read its source text, send the codebook's JSON Schema + text to the "
+        "LLM, coerce every returned value to the declared type, and write the "
+        "typed row to extracted.jsonl (keyed by `id`). One LLM call per item.\n\n"
+        "PILOT-THEN-SCALE PROTOCOL (built in):\n"
+        "  • Default `limit=3` if you don't set one — a tiny pilot so you can "
+        "    inspect coverage and value sanity BEFORE running on hundreds of "
+        "    rows. Read the per-variable coverage in the output, then call "
+        "    `assess_sample(layer='silver')` for a verdict.\n"
+        "  • Once the pilot looks good, call again with `limit=null` (or a "
+        "    large explicit number) to extract the rest. The skip_existing "
+        "    default ensures we don't re-extract rows already done.\n\n"
+        "Pass `limit=0` or `limit=null` and `pilot=false` to bypass the pilot "
+        "default and process EVERY row in one call (use this only when you "
+        "have evidence the codebook is solid)."
     )
     args_schema = {
-        "limit": {"type": "integer", "description": "Only process the first N items (default all)."},
+        "limit": {"type": "integer", "description": "Only process the first N items. Default 3 (pilot)."},
+        "pilot": {
+            "type": "boolean", "default": True,
+            "description": "If true (default) and no explicit limit, run a small pilot batch first.",
+        },
         "skip_existing": {
             "type": "boolean",
             "default": True,
-            "description": "Skip rows that already have at least 50% of codebook variables populated.",
+            "description": "Skip rows already present in extracted.jsonl (by id).",
         },
         "max_chars_per_item": {"type": "integer", "default": 24000},
         "delay_ms": {"type": "integer", "default": 0},
@@ -151,13 +165,24 @@ class ExtractItemsTool(Tool):
         max_chars = int(args.get("max_chars_per_item") or 24000)
         delay = max(0, int(args.get("delay_ms") or 0)) / 1000.0
 
+        # PILOT-THEN-SCALE: if the caller didn't specify a limit AND silver
+        # is currently empty, run a 3-item pilot first. This stops the agent
+        # from burning hundreds of LLM calls on a broken codebook.
+        extracted_ds = state.extracted_dataset()
+        existing_extracted_ids = {
+            str(r.get("id")) for r in extracted_ds.rows() if r.get("id") is not None
+        }
+        pilot_default = bool(args.get("pilot", True))
+        is_pilot_run = False
+        if limit is None and pilot_default and len(existing_extracted_ids) == 0:
+            limit = 3
+            is_pilot_run = True
+
         var_names = [v.name for v in cb.variables]
         targets: list[dict] = []
         for r in rows:
-            if skip_existing:
-                present = sum(1 for n in var_names if r.get(n) is not None)
-                if present >= max(1, len(var_names) // 2):
-                    continue
+            if skip_existing and str(r.get("id")) in existing_extracted_ids:
+                continue
             targets.append(r)
             if limit is not None and len(targets) >= int(limit):
                 break
@@ -171,23 +196,76 @@ class ExtractItemsTool(Tool):
         warnings_total = 0
         per_var_coverage: dict[str, int] = {n: 0 for n in var_names}
         errors: list[str] = []
+        model_name = getattr(getattr(self.llm, "config", None), "model", "extractor")
+        state.emit_progress(
+            event="extract_start", total=len(targets), n_variables=len(var_names),
+            model=model_name,
+        )
         for i, r in enumerate(targets):
+            iid = r.get("id", f"row_{i}")
+            state.emit_progress(
+                event="extract_item_start",
+                index=i + 1, total=len(targets), id=iid, model=model_name,
+            )
             try:
                 merged, warn = extract_one_item(
                     self.llm, r, cb, state.workdir, max_chars=max_chars
                 )
-                # Upsert by id.
-                key = r.get("id")
-                state.dataset.upsert(merged)
+                # Write the typed-only row to the SILVER dataset
+                # (extracted.jsonl). The raw harvest row in `state.dataset`
+                # is left untouched.
+                # If the bronze row had no `id`, the silver upsert will
+                # silently fail (silver is keyed by id). Detect and surface
+                # this rather than counting it as a success.
+                if merged.get("id") is None:
+                    errors.append(
+                        f"  - row {i}: BRONZE row has no `id` field, so the typed "
+                        "row can't be saved (silver is keyed by id). Re-harvest "
+                        "via scrape_paginated (auto-ids rows) or call dataset_append "
+                        "again (which now auto-ids missing ids)."
+                    )
+                    state.emit_progress(
+                        event="extract_item_failed",
+                        index=i + 1, total=len(targets), id="<no-id>",
+                        error="bronze row missing id",
+                    )
+                    continue
+                ok, reason = extracted_ds.upsert(merged)
+                if not ok:
+                    errors.append(f"  - id={iid}: silver upsert refused: {reason}")
+                    state.emit_progress(
+                        event="extract_item_failed",
+                        index=i + 1, total=len(targets), id=str(iid),
+                        error=reason,
+                    )
+                    continue
                 extracted_count += 1
                 warnings_total += len(warn)
+                filled = 0
                 for n in var_names:
                     if merged.get(n) is not None:
                         per_var_coverage[n] += 1
+                        filled += 1
+                state.emit_progress(
+                    event="extract_item_done",
+                    index=i + 1, total=len(targets), id=iid,
+                    filled=filled, n_variables=len(var_names),
+                    warnings=len(warn),
+                )
             except Exception as e:  # noqa: BLE001
                 errors.append(f"  - id={r.get('id', '?')}: {type(e).__name__}: {e}")
+                state.emit_progress(
+                    event="extract_item_failed",
+                    index=i + 1, total=len(targets), id=iid,
+                    error=str(e)[:200],
+                )
             if delay:
                 time.sleep(delay)
+        state.emit_progress(
+            event="extract_done",
+            total=len(targets), extracted=extracted_count,
+            errors=len(errors), warnings=warnings_total,
+        )
 
         # Coverage summary
         n = extracted_count
@@ -197,10 +275,18 @@ class ExtractItemsTool(Tool):
                 c = per_var_coverage.get(v.name, 0)
                 pct = c / n
                 cov_lines.append(f"  {v.name:<28} {pct:.0%}  ({c}/{n})")
+            cb_path = Path(state.memory.get("codebook_path") or (Path(state.workdir) / "codebook.json"))
+            if cb_path.exists():
+                state.memory.set(
+                    "last_extracted_codebook_hash",
+                    hashlib.sha256(cb_path.read_bytes()).hexdigest(),
+                )
+                state.memory.set("last_extracted_codebook_variables", var_names)
 
         out = [
             f"extract_items: processed={extracted_count}  errors={len(errors)}  warnings={warnings_total}",
-            f"dataset_rows_now: {len(state.dataset)}",
+            f"raw_rows: {len(state.dataset)}   extracted_rows: {len(extracted_ds)}",
+            f"silver_path: {extracted_ds.path}",
             "",
             "per-variable coverage:",
             *cov_lines,
@@ -211,4 +297,78 @@ class ExtractItemsTool(Tool):
             out.extend(errors[:10])
             if len(errors) > 10:
                 out.append(f"  ... and {len(errors) - 10} more")
-        return ToolResult(output="\n".join(out))
+
+        # PILOT verdict — synthesised here so the agent doesn't need a
+        # follow-up assess_sample call for the simple case.
+        if is_pilot_run:
+            avg_cov = (
+                sum(per_var_coverage.values()) / (extracted_count * len(var_names))
+                if extracted_count and var_names else 0
+            )
+            zero_cov_vars = [n for n in var_names if per_var_coverage.get(n, 0) == 0]
+            verdict = "SCALE_OK"
+            advice: list[str] = []
+            # Inspect the bronze sample text — a common failure is that the
+            # raw rows have no actual text content (e.g. the listing
+            # extractor captured ids but not titles/abstracts).
+            empty_text_rows = 0
+            for r in targets[:extracted_count]:
+                t = _row_text(r, str(state.workdir)) if 'targets' in dir() else ""
+                if not t or len(t) < 50:
+                    empty_text_rows += 1
+            if extracted_count == 0:
+                verdict = "FIX_FIRST"
+                advice.append("0 items extracted — every pilot row failed. Check the codebook + the row text.")
+            elif avg_cov < 0.10:
+                # Catastrophic — almost certainly the BRONZE rows have no
+                # real text content. Don't waste another LLM call until the
+                # bronze is fixed.
+                verdict = "FIX_BRONZE_FIRST"
+                advice.append(
+                    f"average fill is {avg_cov*100:.0f}% — pilot rows had nothing for the LLM to read."
+                )
+                if empty_text_rows >= extracted_count // 2:
+                    advice.append(
+                        f"{empty_text_rows}/{extracted_count} pilot rows have < 50 chars of source text. "
+                        "Your BRONZE rows are mostly empty. Run `assess_sample(layer='bronze')` to confirm, "
+                        "then either: (a) re-run extractor_define so the listing actually captures the "
+                        "text fields, or (b) switch to listing+detail and use process_queue(mode='text') "
+                        "to fetch each item's detail page."
+                    )
+                else:
+                    advice.append(
+                        "Possible causes: codebook variables don't match the content, the extraction "
+                        "prompt is too generic, or the text is in a language the codebook didn't anticipate."
+                    )
+            elif avg_cov < 0.40:
+                verdict = "FIX_FIRST"
+                advice.append(
+                    f"average coverage is only {avg_cov*100:.0f}% — most variables aren't being "
+                    "filled. Likely causes: (a) the codebook variables don't match what the text "
+                    "contains, (b) row text is too short / missing, (c) extraction prompt is unclear."
+                )
+            elif len(zero_cov_vars) >= max(3, len(var_names) // 4):
+                verdict = "FIX_FIRST"
+                advice.append(
+                    f"{len(zero_cov_vars)} variables have 0% coverage: "
+                    f"{zero_cov_vars[:6]}{'…' if len(zero_cov_vars) > 6 else ''}. "
+                    "Drop or rewrite them via codebook_edit, then re-pilot."
+                )
+            out.append("")
+            out.append(f"PILOT verdict: {verdict}  (pilot size={extracted_count}, avg coverage={avg_cov*100:.0f}%)")
+            if verdict == "SCALE_OK":
+                out.append(
+                    "→ Looks healthy. Call extract_items again WITHOUT a limit "
+                    "(or with limit=null) to process the remaining "
+                    f"{len(state.dataset) - extracted_count} rows."
+                )
+            else:
+                for a in advice:
+                    out.append(f"  • {a}")
+                out.append("→ Fix the codebook (codebook_edit / codebook_design with revised hints) BEFORE scaling.")
+        return ToolResult(output="\n".join(out),
+                           artifact={
+                               "extracted": extracted_count,
+                               "pilot": is_pilot_run,
+                               "n_variables": len(var_names),
+                           })

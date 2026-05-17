@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,6 +23,114 @@ from gemma42.tools.codebook_tool import _load_codebook_from_state
 
 if TYPE_CHECKING:
     from gemma42.state import AgentState
+
+
+def _infer_dataset_stats(rows: list[dict]) -> dict:
+    """Per-column inferred stats when no codebook is defined."""
+    import statistics
+
+    n = len(rows)
+    cols: dict[str, list] = {}
+    for r in rows:
+        for k, v in r.items():
+            if k.startswith("_"):
+                continue
+            cols.setdefault(k, []).append(v)
+    out: list[dict] = []
+    for name, values in cols.items():
+        nn = [v for v in values if v not in (None, "")]
+        info = {
+            "name": name,
+            "coverage": len(nn) / n if n else 0.0,
+            "n_non_null": len(nn),
+        }
+        # Infer type from observations
+        if all(isinstance(v, bool) for v in nn) and nn:
+            info["type"] = "boolean"
+            info["pct_true"] = sum(1 for v in nn if v) / len(nn)
+        elif nn and all(isinstance(v, int) and not isinstance(v, bool) for v in nn):
+            info["type"] = "integer"
+            info["min"] = min(nn); info["max"] = max(nn)
+            info["mean"] = sum(nn) / len(nn)
+            if len(nn) > 1:
+                info["stdev"] = statistics.stdev(nn)
+        elif nn and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in nn):
+            info["type"] = "float"
+            info["min"] = min(nn); info["max"] = max(nn)
+            info["mean"] = sum(nn) / len(nn)
+        elif nn and all(isinstance(v, str) for v in nn):
+            info["type"] = "string"
+            info["n_unique"] = len({str(v) for v in nn})
+            lens = [len(v) for v in nn]
+            info["mean_len"] = sum(lens) / len(lens) if lens else 0
+        else:
+            info["type"] = "mixed"
+        out.append(info)
+    return {"n_rows": n, "n_columns": len(cols), "variables": out,
+             "issues": []}
+
+
+def _synthesise_codebook_from_rows(rows: list[dict], *,
+                                    workdir: str | Path) -> "Codebook":
+    """Build a Codebook with VariableSpec for each observed column.
+
+    Used when the user wanted a simple table dump without designing a
+    research-grade codebook. Types are inferred from the data.
+    """
+    from gemma42.codebook import Codebook, VariableSpec
+
+    cols: dict[str, list] = {}
+    for r in rows:
+        for k, v in r.items():
+            if k.startswith("_"):
+                continue
+            cols.setdefault(k, []).append(v)
+
+    variables: list[VariableSpec] = []
+    for name, values in cols.items():
+        nn = [v for v in values if v not in (None, "")]
+        if not nn:
+            t = "string"
+        elif all(isinstance(v, bool) for v in nn):
+            t = "boolean"
+        elif all(isinstance(v, int) and not isinstance(v, bool) for v in nn):
+            t = "integer"
+        elif all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in nn):
+            t = "float"
+        else:
+            t = "string"
+        variables.append(VariableSpec(
+            name=name, type=t,
+            description=f"Auto-inferred column from observed data.",
+        ))
+
+    cb_name = Path(workdir).name or "dataset"
+    cb_name = re.sub(r"[^\w]+", "_", cb_name).strip("_") or "dataset"
+    return Codebook(
+        name=cb_name,
+        description="Auto-synthesised codebook (no LLM-designed schema requested).",
+        variables=variables,
+    )
+
+
+def _format_inferred_stats(s: dict) -> str:
+    lines = [
+        f"dataset: {s['n_rows']} rows × {s['n_columns']} columns",
+        "",
+    ]
+    for v in s["variables"]:
+        head = f"  {v['name']:<25}  type={v['type']:<8}  coverage={v['coverage']:.0%}"
+        extras: list[str] = []
+        if v["type"] in ("integer", "float") and "mean" in v:
+            extras.append(f"min={v['min']} max={v['max']} mean={v['mean']:.2f}")
+        elif v["type"] == "boolean" and "pct_true" in v:
+            extras.append(f"true={v['pct_true']:.0%}")
+        elif v["type"] == "string" and "mean_len" in v:
+            extras.append(f"unique={v.get('n_unique', '?')}  avg_len={v['mean_len']:.0f}")
+        if extras:
+            head += "  " + " ".join(extras)
+        lines.append(head)
+    return "\n".join(lines)
 
 
 class DatasetValidateTool(Tool):
@@ -38,11 +147,19 @@ class DatasetValidateTool(Tool):
 
     def run(self, args: dict, state: "AgentState") -> ToolResult:
         cb = _load_codebook_from_state(state)
-        if cb is None:
-            return ToolResult(output="ERROR: no codebook saved", error=True)
         rows = state.dataset.rows()
-        s = codebook_stats(rows, cb)
-        return ToolResult(output=format_stats(s), artifact=s)
+        if not rows:
+            return ToolResult(output="ERROR: dataset is empty", error=True)
+        if cb is not None:
+            s = codebook_stats(rows, cb)
+            return ToolResult(output=format_stats(s), artifact=s)
+        # No codebook → infer per-column stats from the observed rows.
+        s = _infer_dataset_stats(rows)
+        return ToolResult(
+            output=("(no codebook — using observed column types)\n\n"
+                     + _format_inferred_stats(s)),
+            artifact=s,
+        )
 
 
 class DatasetExportTool(Tool):
@@ -67,14 +184,45 @@ class DatasetExportTool(Tool):
 
     def run(self, args: dict, state: "AgentState") -> ToolResult:
         cb = _load_codebook_from_state(state)
-        if cb is None:
-            return ToolResult(output="ERROR: no codebook saved", error=True)
-        rows = state.dataset.rows()
-        if not rows:
+        raw_rows = state.dataset.rows()
+        if not raw_rows:
             return ToolResult(output="ERROR: dataset is empty", error=True)
+
+        # Pull silver (typed variables from Gemma extraction) if it exists.
+        # Bronze + silver are kept in separate files at runtime so the counts
+        # are clean; we JOIN them here at export time by `id`.
+        extracted_path = Path(state.workdir) / "extracted.jsonl"
+        extracted_by_id: dict[str, dict] = {}
+        if extracted_path.exists() and extracted_path.stat().st_size > 0:
+            for line in extracted_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    import json as _json
+                    r = _json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(r, dict) and r.get("id") is not None:
+                    extracted_by_id[str(r["id"])] = r
+        # Build a merged view for the main parquet: raw fields ⊕ typed fields.
+        rows: list[dict] = []
+        for r in raw_rows:
+            merged = dict(r)
+            silver = extracted_by_id.get(str(r.get("id")), {})
+            for k, v in silver.items():
+                if k != "id":
+                    merged[k] = v
+            rows.append(merged)
 
         out_dir = Path(args.get("out_dir") or (Path(state.workdir) / "export"))
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        # No-codebook fallback: synthesise one from the observed columns so
+        # the parquet writer + card still work.
+        synthesised_codebook = False
+        if cb is None:
+            cb = _synthesise_codebook_from_rows(rows, workdir=state.workdir)
+            synthesised_codebook = True
 
         # Carry over common metadata fields that aren't in the codebook.
         var_names = {v.name for v in cb.variables}
@@ -111,26 +259,65 @@ class DatasetExportTool(Tool):
         json_path = out_dir / "codebook.json"
         cb.save(json_path)
 
-        # JSONL copy
+        # JSONL copies — both bronze (raw) and the merged (raw ⊕ typed).
         import shutil
-
-        jsonl_src = Path(state.dataset.path)
+        jsonl_raw_src = Path(state.dataset.path)
+        jsonl_raw_dst = out_dir / f"{cb.name}_raw.jsonl"
+        shutil.copy2(jsonl_raw_src, jsonl_raw_dst)
+        # Merged JSONL (what most consumers want).
         jsonl_dst = out_dir / f"{cb.name}.jsonl"
-        shutil.copy2(jsonl_src, jsonl_dst)
+        with jsonl_dst.open("w", encoding="utf-8") as f:
+            for r in rows:
+                import json as _json
+                f.write(_json.dumps(r, ensure_ascii=False) + "\n")
+        # Silver-only JSONL (id + typed cols), if extraction happened.
+        typed_jsonl_dst = None
+        if extracted_by_id:
+            typed_jsonl_dst = out_dir / f"{cb.name}_typed.jsonl"
+            shutil.copy2(extracted_path, typed_jsonl_dst)
+
+        # Optional typed-only parquet — id + codebook columns, no text bloat.
+        typed_parquet_path = None
+        if extracted_by_id:
+            typed_rows: list[dict] = []
+            keep = {"id"} | {v.name for v in cb.variables}
+            for r in rows:
+                typed_rows.append({k: v for k, v in r.items() if k in keep})
+            try:
+                typed_parquet_path = write_parquet(
+                    typed_rows,
+                    cb,
+                    out_dir / f"{cb.name}_typed.parquet",
+                    extra_metadata_fields=("id",),
+                )
+            except Exception:  # noqa: BLE001
+                typed_parquet_path = None
 
         out = [
             f"export → {out_dir}",
-            f"  jsonl:    {jsonl_dst}  ({len(rows)} rows)",
-            f"  codebook: {json_path}",
-            f"  card:     {md_path}",
+            f"  jsonl:        {jsonl_dst}  ({len(rows)} rows, raw ⊕ typed)",
+            f"  jsonl_raw:    {jsonl_raw_dst}  (bronze, raw harvest only)",
         ]
+        if typed_jsonl_dst:
+            out.append(f"  jsonl_typed:  {typed_jsonl_dst}  ({len(extracted_by_id)} extracted)")
+        out.append(
+            f"  codebook:     {json_path}"
+            + ('  (auto-synthesised from columns)' if synthesised_codebook else '')
+        )
+        out.append(f"  card:         {md_path}")
         if parquet_path:
-            out.append(f"  parquet:  {parquet_path}")
+            out.append(f"  parquet:      {parquet_path}")
         else:
-            out.append(f"  parquet:  SKIPPED ({parquet_err})")
+            out.append(f"  parquet:      SKIPPED ({parquet_err})")
+        if typed_parquet_path:
+            out.append(f"  parquet_typed: {typed_parquet_path}  (id + codebook columns only)")
         return ToolResult(
             output="\n".join(out),
-            artifact={"out_dir": str(out_dir), "n_rows": len(rows)},
+            artifact={
+                "out_dir": str(out_dir),
+                "n_rows": len(rows),
+                "n_extracted": len(extracted_by_id),
+            },
         )
 
 
