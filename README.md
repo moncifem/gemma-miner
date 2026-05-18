@@ -6,8 +6,9 @@
 
 **Turn any website or document corpus into a typed, research-grade dataset — in minutes, autonomously.**
 
-[![PyPI](https://img.shields.io/pypi/v/gemma-miner.svg?color=blue)](https://pypi.org/project/gemma-miner/)
-[![Python](https://img.shields.io/pypi/pyversions/gemma-miner.svg)](https://pypi.org/project/gemma-miner/)
+[![PyPI](https://img.shields.io/pypi/v/gemma-miner.svg?color=blue&cache_seconds=300)](https://pypi.org/project/gemma-miner/)
+[![Python](https://img.shields.io/pypi/pyversions/gemma-miner.svg?cache_seconds=300)](https://pypi.org/project/gemma-miner/)
+[![Downloads](https://img.shields.io/pypi/dm/gemma-miner.svg?color=brightgreen&cache_seconds=3600)](https://pypi.org/project/gemma-miner/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-brightgreen.svg)](LICENSE)
 [![HF Datasets](https://img.shields.io/badge/🤗-datasets-yellow)](https://huggingface.co/moncefem)
 
