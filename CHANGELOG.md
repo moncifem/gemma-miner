@@ -4,6 +4,30 @@ All notable changes to **Gemma Miner** will be documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] — 2026
+
+Quality-of-life pass after the initial PyPI release.
+
+### Added
+
+- **`/clean-config`** slash command — deletes
+  `~/.config/gemma-miner/config.toml` (after confirmation), wipes any env
+  vars it had previously applied, and offers to re-run the setup wizard.
+- **Automatic 401-recovery** in the REPL: when a chat call fails with
+  HTTP 401 / "User not found" / "Unauthorized", the REPL prompts for a
+  fresh API key (masked), saves it to the central config, and retries
+  the request — no need to restart.
+
+### Changed
+
+- **Install docs**: README now recommends `uv tool install gemma-miner`
+  (CLI-on-PATH) as the primary install, with `uv pip install` only as a
+  library-use fallback. Closes the confusing "No virtual environment
+  found" / "No pyproject.toml found" errors users hit on first try.
+- **Wizard wording** explicitly tells the user that input is masked and
+  that the key is stored at `~/.config/gemma-miner/config.toml`
+  (chmod 600).
+
 ## [0.1.0] — 2025
 
 First public release. Brand renamed from internal "gemma42" to

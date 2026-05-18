@@ -59,24 +59,36 @@ their cards and load them:
 
 ## Install
 
+`gemma-miner` is a CLI tool, so the cleanest install is `uv tool install`
+(or `pipx install`) — it puts a `gemma-miner` binary on your PATH inside an
+isolated environment:
+
 ```bash
-# core (most users want this)
-uv pip install gemma-miner
+# recommended — installs as an isolated CLI tool
+uv tool install gemma-miner
 
-# + parsers (PDF / DOCX / XLSX / EPUB / archives)
-uv pip install "gemma-miner[parsers]"
-
-# + Hugging Face push
-uv pip install "gemma-miner[hf]"
-
-# + analysis (pandas, matplotlib, numpy for the chart scripts)
-uv pip install "gemma-miner[analysis]"
-
-# everything
-uv pip install "gemma-miner[all]"
+# with optional extras:
+uv tool install "gemma-miner[parsers]"   # PDF / DOCX / XLSX / EPUB / archives
+uv tool install "gemma-miner[hf]"        # huggingface_hub + datasets (for /push)
+uv tool install "gemma-miner[analysis]"  # pandas + matplotlib + numpy
+uv tool install "gemma-miner[all]"       # everything above
 ```
 
-Plain `pip install gemma-miner` works identically — `uv` is just faster.
+Then just run it from anywhere:
+
+```bash
+gemma-miner            # interactive REPL
+gemma-miner configure  # re-run the setup wizard
+gemma-miner --help     # full command list
+```
+
+Alternative installs:
+
+| Use case | Command |
+|---|---|
+| Try it once without installing | `uv run --with gemma-miner gemma-miner` |
+| Add it as a library to an existing project | `cd your-project && uv add gemma-miner` |
+| Plain pip (no uv) | `pipx install gemma-miner` |
 
 ## First launch (Claude-Code style REPL)
 

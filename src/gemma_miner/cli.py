@@ -1141,6 +1141,58 @@ def _classify_and_reply(
             response_format={"type": "json_object"},
         )
     except Exception as e:  # noqa: BLE001
+        err = str(e)
+        # Auth failures are recoverable: walk the user through pasting a
+        # fresh key, save it, retry once. This catches the case where a
+        # stored key has been revoked or rotated.
+        if ("401" in err or "User not found" in err or "Unauthorized" in err
+                or "Invalid API key" in err):
+            provider = getattr(getattr(llm, "config", None), "model", "?")
+            # Best-effort: figure out which provider this LLM belongs to.
+            base_url = getattr(getattr(llm, "config", None), "base_url", "")
+            provider_name: str | None = None
+            for p, env_name in _cfg.PROVIDER_API_KEY_ENV.items():
+                if env_name and env_name.lower().split("_")[0] in base_url:
+                    provider_name = p
+                    break
+            console.print(
+                "[red]Your API key was rejected (HTTP 401).[/red]\n"
+                "[dim]This usually means the stored key has been revoked, "
+                "rotated, or is for the wrong account.[/dim]"
+            )
+            if provider_name:
+                env_name = _cfg.PROVIDER_API_KEY_ENV.get(provider_name) or ""
+                console.print(
+                    f"  [dim]Paste a fresh [white]{provider_name}[/white] API key "
+                    f"(env var [white]{env_name}[/white]). Input is masked.\n"
+                    f"  Saved to [white]{_cfg.config_path()}[/white].\n"
+                    f"  Or press Enter to skip and use [white]/clean-config[/white].[/dim]"
+                )
+                new_key = Prompt.ask("  key", default="", password=True).strip()
+                if new_key:
+                    _cfg.set_api_key(provider_name, new_key)
+                    if env_name:
+                        os.environ[env_name] = new_key
+                    # Rebuild the client with the new key.
+                    try:
+                        llm.config.api_key = new_key
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        raw = llm.chat(
+                            messages,
+                            temperature=0.2,
+                            response_format={"type": "json_object"},
+                        )
+                    except Exception as e2:  # noqa: BLE001
+                        return ("chat", f"(still failing after key update: {e2})")
+                    obj = _parse_json_obj(raw) or {}
+                    mode = str(obj.get("mode", "chat")).lower()
+                    if mode not in ("chat", "task"):
+                        mode = "chat"
+                    return (mode, str(obj.get("reply") or "").strip() or raw.strip())
+            return ("chat", f"(could not reach the model: {e})\n"
+                            f"Run [white]/clean-config[/white] to reset.")
         return ("chat", f"(could not reach the model: {e})")
     obj = _parse_json_obj(raw) or {}
     mode = str(obj.get("mode", "chat")).lower()
@@ -1290,6 +1342,7 @@ def _push_workdir_to_hf(workdir: Path, repo_id: str, *, private: bool = True) ->
 SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/help",              "show this help"),
     ("/config",            "(re)run the provider + API-key setup wizard"),
+    ("/clean-config",      "delete the stored config and re-run the wizard"),
     ("/datasets",          "list datasets produced in this workspace"),
     ("/workdir [<path>]",  "show or change the base workdir (./runs)"),
     ("/provider [<name>]", "show or switch LLM provider (together/ollama/...)"),
@@ -1530,6 +1583,48 @@ class REPL:
 
         if cmd in ("help", "?"):
             _show_help()
+        elif cmd == "clean-config":
+            cfg_path = _cfg.config_path()
+            if not cfg_path.exists():
+                console.print("[dim]no config to clean — already empty.[/dim]")
+            else:
+                confirm = Prompt.ask(
+                    f"[yellow]delete[/yellow] {cfg_path} "
+                    "[yellow]and clear stored API keys?[/yellow]",
+                    choices=["y", "n"], default="n",
+                )
+                if confirm == "y":
+                    try:
+                        cfg_path.unlink()
+                        # Wipe the env vars we previously applied from config
+                        # so the next run starts truly clean.
+                        for env_name in _cfg.PROVIDER_API_KEY_ENV.values():
+                            if env_name and env_name in os.environ:
+                                del os.environ[env_name]
+                        console.print("[green]config cleared.[/green]")
+                        rerun = Prompt.ask(
+                            "  re-run the setup wizard now?",
+                            choices=["y", "n"], default="y",
+                        )
+                        if rerun == "y":
+                            run_configure_wizard(welcome=True)
+                            _cfg.apply_env()
+                            new_provider = _cfg.get_default_provider() or self.provider
+                            new_model = _cfg.get_recent_model(new_provider) or self.model
+                            try:
+                                self.llm = make_llm(new_provider, model=new_model)
+                                self.provider = new_provider
+                                self.model = self.llm.config.model
+                                console.print(
+                                    f"[green]active provider → "
+                                    f"{self.provider}/{self.model}[/green]"
+                                )
+                            except Exception as e:  # noqa: BLE001
+                                console.print(f"[red]could not switch active LLM: {e}[/red]")
+                    except OSError as e:
+                        console.print(f"[red]could not delete config: {e}[/red]")
+                else:
+                    console.print("[dim]cancelled.[/dim]")
         elif cmd == "config":
             run_configure_wizard(welcome=False)
             # Re-apply env and re-init the LLM with the new defaults.
@@ -1978,14 +2073,17 @@ def _wizard_get_api_key(provider: str, *, existing: str | None = None) -> str | 
         return None  # ollama
     if existing:
         keep = Prompt.ask(
-            f"  An API key for [cyan]{provider}[/cyan] is already stored (••••{existing[-4:]}). Replace it?",
+            f"  An API key for [cyan]{provider}[/cyan] is already stored "
+            f"(••••{existing[-4:]}). Replace it?",
             choices=["y", "n"], default="n",
         )
         if keep == "n":
             return existing
     console.print(
         f"  [dim]Paste your {provider} API key (env var [white]{env_name}[/white]).\n"
-        f"  Press Enter to skip — you can run [white]gemma-miner configure[/white] later.[/dim]"
+        f"  Your input is masked. The key is stored locally at\n"
+        f"  [white]{_cfg.config_path()}[/white] (chmod 600 — owner-only).\n"
+        f"  Press Enter to skip — you can re-run [white]gemma-miner configure[/white] later.[/dim]"
     )
     key = Prompt.ask("  key", default="", password=True).strip()
     return key or existing
