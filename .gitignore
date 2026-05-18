@@ -1,12 +1,36 @@
-# Python-generated files
+# ── Python ──────────────────────────────────────────────────────────────
 __pycache__/
 *.py[oc]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Build artefacts ────────────────────────────────────────────────────
 build/
 dist/
 wheels/
-*.egg-info
+*.whl
+*.tar.gz
 
-# Virtual environments
-.venv
+# ── Virtual environments / IDE ─────────────────────────────────────────
+.venv/
+venv/
 .env
-.idea
+.envrc
+.idea/
+.vscode/
+.DS_Store
+
+# ── Agent run outputs (datasets, traces, cache) ────────────────────────
+# Each run produces a workdir under ./runs/<slug>/ with the harvested
+# dataset, cache, codebook and trace logs. Commit datasets you want to
+# ship separately (e.g. push to a HF dataset repo) — don't commit them
+# into this repo by default.
+runs/
+
+# ── Test / coverage artefacts ──────────────────────────────────────────
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml

@@ -1,111 +1,150 @@
-# gemma42
+<div align="center">
 
-A structured scraping & dataset-construction agent designed for **small open
-models** (Gemma 3, Llama 3, Mistral, Qwen) served through Together AI or any
-OpenAI-compatible endpoint.
+<img src="assets/hero.png" alt="Gemma Miner — extract, analyze, discover" width="100%"/>
 
-The point of `gemma42` is to let a 7B–30B model behave like a state-of-the-art
-agent on a narrow but useful task: **read a website, identify the repeating
-unit of data, extract it row by row, and stop only when the user's spec is
-fully met.**
+# ⛏ Gemma Miner
 
-## What it does
+**Turn any website or document corpus into a typed, research-grade dataset — in minutes, autonomously.**
 
-- **Reads the open web** with stdlib-grade HTTP + HTML inspection tools.
-- **Builds a JSONL dataset** with optional JSON-Schema validation and
-  uniqueness constraints.
-- **Honours contracts**: declarative requirements (`min_rows=100`,
-  `required_fields=[…]`, `unique_field=id`) that gate the `finish` tool.
-  The agent literally cannot terminate until every contract is `OK`.
-- **Contracts are mutable mid-run**: if you (or the agent) realise the spec
-  changed — "actually I need 200 rows, and a `points` field too" — call the
-  `add_contract` tool and the loop keeps going.
-- **Has memory**: a persistent JSON KV store the agent uses to recall
-  selectors, schemas, and other site-specific facts across turns and runs.
-- **Has a code tool**: ad-hoc Python in a sandboxed subprocess for parsing,
-  transforming, and computing — without giving the model a destructive shell.
-  `rm`, `dd`, `mkfs`, `sudo`, etc. are blocked at the tool layer.
-- **Drives the LLM as a tool too**: `extract_structured` runs the same
-  small model under a strict extraction system prompt against any JSON
-  Schema. Great for prose-heavy sources (legal decisions, articles).
-- **Exports to Hugging Face** with a single command.
+[![PyPI](https://img.shields.io/pypi/v/gemma-miner.svg?color=blue)](https://pypi.org/project/gemma-miner/)
+[![Python](https://img.shields.io/pypi/pyversions/gemma-miner.svg)](https://pypi.org/project/gemma-miner/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-brightgreen.svg)](LICENSE)
+[![HF Datasets](https://img.shields.io/badge/🤗-datasets-yellow)](https://huggingface.co/moncefem)
+
+</div>
+
+Gemma Miner is an autonomous agent that takes a one-sentence brief —
+*"build me a stats-ready dataset of CNIL sanctions"*,
+*"3 000 AI clinical trials"*,
+*"every Hacker News 'Who is hiring' post mentioning RAG"* —
+and produces a typed Parquet dataset with codebook, charts and HF-ready card.
+
+It handles **harvest → typed schema design → per-row extraction →
+self-verification → export to Parquet/CSV/HuggingFace** in a single run.
+Works with **Ollama (local Gemma 4 31B)**, **OpenRouter**, **Together AI**,
+**Featherless** — or any OpenAI-compatible endpoint.
+
+---
+
+## Why it exists
+
+Most "scrape this site" tools give you a JSON dump of raw fields. That's not a
+dataset — it's a starting point. Gemma Miner closes the loop:
+
+1. **Read** the source (HTML, JSON API, PDF / DOCX / XLSX / archives).
+2. **Design a codebook** of 20–60 typed analytical variables — booleans,
+   enums, integers, dates — appropriate for the corpus.
+3. **Extract every row** through the codebook with deterministic type
+   coercion (dates → ISO, enums snapped to nearest valid value,
+   booleans null-when-silent, no placeholder stuffing).
+4. **Self-verify** before declaring done. If verification fails, retry
+   with corrective feedback.
+5. **Export** to Parquet + CSV + a Markdown codebook, and optionally push
+   to the Hugging Face Hub with a one-line command.
+
+The result is a dataset you can drop into pandas, DuckDB or scikit-learn
+without a second cleaning pass.
+
+## See it in action
+
+Two real datasets built end-to-end by Gemma Miner — click through to read
+their cards and load them:
+
+| Dataset | Rows × Cols | Source | Try it |
+|---|---|---|---|
+| 🇫🇷 [**CNIL Sanctions 2011-2025**](https://huggingface.co/datasets/moncefem/cnil-sanctions-2011-2025) | 374 × 34 | [cnil.fr](https://www.cnil.fr/fr/les-sanctions-prononcees-par-la-cnil) | `load_dataset("moncefem/cnil-sanctions-2011-2025")` |
+| 🧬 [**Clinical Trials of AI 2000-2025**](https://huggingface.co/datasets/moncefem/clinical-trials-ai-2000-2025) | 3 000 × 30 | [clinicaltrials.gov](https://clinicaltrials.gov) | `load_dataset("moncefem/clinical-trials-ai-2000-2025")` |
+
+---
 
 ## Install
 
 ```bash
-uv pip install gemma42                # core
-uv pip install "gemma42[parsers]"     # + pdf/docx/xlsx/epub/... extractors
-uv pip install "gemma42[hf]"          # + huggingface export
-uv pip install "gemma42[all]"         # everything
+# core (most users want this)
+uv pip install gemma-miner
+
+# + parsers (PDF / DOCX / XLSX / EPUB / archives)
+uv pip install "gemma-miner[parsers]"
+
+# + Hugging Face push
+uv pip install "gemma-miner[hf]"
+
+# + analysis (pandas, matplotlib, numpy for the chart scripts)
+uv pip install "gemma-miner[analysis]"
+
+# everything
+uv pip install "gemma-miner[all]"
 ```
 
-Or from source:
+Plain `pip install gemma-miner` works identically — `uv` is just faster.
+
+## First launch (Claude-Code style REPL)
 
 ```bash
-git clone https://github.com/yourname/gemma42 && cd gemma42
-uv pip install -e ".[hf,dev]"
+gemma-miner
 ```
 
-## Providers
+On first launch you get a setup wizard that walks you through:
 
-Anything that speaks the OpenAI chat-completions protocol works. Built-in
-presets:
+1. Pick a provider (`ollama` / `openrouter` / `together` / `featherless`).
+2. Paste an API key (or skip for Ollama — fully local).
+3. Pick a default model. For Ollama, the wizard shows the live list of
+   models you have installed (queried from `/api/tags`).
 
-| Provider | Default model | API key env |
-|---|---|---|
-| `together` | `google/gemma-3n-E4B-it` | `TOGETHER_API_KEY` |
-| `ollama` | `gemma4:latest` (local) | — |
-| `groq` | `llama-3.1-70b-versatile` | `GROQ_API_KEY` |
-| `openrouter` | `google/gemini-3.1-pro-preview` | `OPENROUTER_API_KEY` |
-| `fireworks` | `accounts/fireworks/models/gemma2-27b-it` | `FIREWORKS_API_KEY` |
-| `openai` | `gpt-4o-mini` | `OPENAI_API_KEY` |
-| `openai-compatible` | (pass `--base-url` + `--model`) | optional |
+Your choice is saved to `~/.config/gemma-miner/config.toml` (chmod 600).
+Switch any time with `/config` inside the REPL, or `gemma-miner configure`
+from the shell.
 
-```python
-from gemma42 import make_llm
+Inside the REPL:
 
-llm = make_llm("ollama", model="gemma4:latest")        # local extraction
-llm = make_llm("openrouter", model="google/gemini-3.1-pro-preview")
-llm = make_llm("openai-compatible",
-               base_url="http://my-vllm:8000/v1",
-               model="meta-llama/Meta-Llama-3.1-8B-Instruct")
-```
+- Type **`/`** to see the live command palette (filters as you keep typing).
+- Just type plain English to start a run: *"build me a dataset of the top
+  100 Hacker News stories with id, title, points, comments."*
+- Multi-line prompts: end the first line with `"""` to open a heredoc,
+  close with `"""`.
+- The agent runs with a live Rich activity feed showing every phase and
+  per-row extraction progress.
 
-For local schema-constrained extraction with Ollama:
+## What the REPL knows how to do
+
+| Slash command | What it does |
+|---|---|
+| `/help` | Full help panel |
+| `/config` | Re-run the provider + API-key setup wizard |
+| `/datasets` | List datasets produced under `./runs/` |
+| `/workdir [<path>]` | Show or change the base workdir |
+| `/provider [<name>]` | Show or switch LLM provider (persisted) |
+| `/model [<id>]` | Show or switch model (persisted per provider) |
+| `/gemma-full-local` | Switch every phase to Ollama Gemma (auto-picks the largest installed Gemma) |
+| `/resume <path>` | Resume a previous run — load its dataset + codebook + memory |
+| `/push <repo_id>` | Push the last dataset to Hugging Face Hub |
+| `/history`, `/clear`, `/trace`, `/quit` | Standard shell controls |
+
+After a run completes, the chat agent has the dataset in memory — ask
+follow-up questions like *"which row had the most points?"* or
+*"summarise the breakdown by sector"* and it answers from the data
+without triggering another scrape.
+
+## One-shot mode (no REPL)
 
 ```bash
-ollama pull gemma4:latest
-gemma42 ask "scrape ..." \
-  --provider openrouter \
-  --model google/gemini-3.1-pro-preview \
-  --extract-provider ollama \
-  --extract-model gemma4:latest
-```
+# free-text prompt — Gemma Miner parses URL + count + fields automatically
+gemma-miner "Build a dataset of every CNIL sanction from \
+https://www.cnil.fr/fr/les-sanctions-prononcees-par-la-cnil with date, \
+organisation type, breaches, decision text and 25 analytical variables."
 
-## Quick start (CLI)
-
-```bash
-export OPENROUTER_API_KEY=...
-
-gemma42 run \
-  --goal "Build a dataset of the current top 100 Hacker News stories with rank, id, title, domain, and points. Use the public JSON API at hacker-news.firebaseio.com." \
+# explicit flags for power users
+gemma-miner run \
+  --goal "Top 100 Hacker News stories" \
   --min-rows 100 \
   --required-fields rank,id,title,points \
   --unique-field id \
   --workdir ./runs/hn \
-  --provider openrouter \
-  --model "google/gemini-3.1-pro-preview" \
-  --extract-provider ollama \
-  --extract-model "gemma4:latest"
+  --provider ollama \
+  --model gemma4:31b
 ```
 
-When the run finishes you get `runs/hn/dataset.jsonl`. Push it:
-
-```bash
-gemma42 export-hf ./runs/hn/dataset.jsonl --repo-id yourname/hn-top100
-```
-
-## Quick start (Python)
+## Python API
 
 ```python
 from gemma42 import (
@@ -125,120 +164,140 @@ result = run_agent(
     ],
     unique_key="id",
     workdir="./runs/hn",
-    llm=make_llm("openrouter", model="google/gemini-3.1-pro-preview"),
-    extraction_llm=make_llm("ollama", model="gemma4:latest"),
+    llm=make_llm("openrouter", model="google/gemini-3.1-flash-lite"),
 )
-print(result)
+print(result.dataset_path)
 ```
 
-See `examples/` for two more end-to-end recipes:
+> The Python module is still named **`gemma42`** internally (the brand
+> was previously `gemma42`); the PyPI package is `gemma-miner`. Both
+> CLI commands (`gemma-miner` and `gemma42`) are equivalent.
 
-- `examples/cnil_sanctions.py` — scrape an HTML table of GDPR fines.
-- `examples/competition_decisions.py` — read PDF decisions and emit one row
-  per decision matching a deeply nested JSON schema (the project's brief
-  example).
-
-## How the agent is structured
+## Architecture
 
 ```
-run_agent(goal, contracts, workdir, llm)
-        │
-        ▼
- ┌──────────────────────────────────────┐
- │             AgentState               │
- │  goal, dataset, contracts, memory,   │
- │  workdir, history                    │
- └──────────────────────────────────────┘
-        │
-        ▼
- ┌──────────────────────────────────────┐
- │            Agent loop                │
- │  ┌── render state brief ───────────┐ │
- │  │  goal + contracts + last 3 obs  │ │
- │  └────────────┬────────────────────┘ │
- │               ▼                      │
- │       LLM (JSON tool call)           │
- │               ▼                      │
- │       parse → dispatch → record      │
- │               ▼                      │
- │     contracts all OK?  →  finish     │
- └──────────────────────────────────────┘
+goal (one sentence)
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│   AgentState (dataset + contracts +     │
+│   memory + plan + workdir)              │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│   Phase machine (recomputed every turn  │
+│   from observable state):               │
+│                                         │
+│   DISCOVER_LISTING → ENUMERATE →        │
+│   DISCOVER_DETAIL → PROCESS →           │
+│   CODEBOOK → EXTRACT → EXPORT → FINISH  │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│   One LLM call per turn → one tool      │
+│   call (HTTP / HTML / Python / extract /│
+│   codebook ops / dataset / queue / …)   │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│   Self-verification before finish.      │
+│   On fail, re-enter the loop with the   │
+│   verifier's feedback in the prompt.    │
+└─────────────────────────────────────────┘
 ```
 
-### Tools shipped by default
+Key design choices:
 
-| Tool | Purpose |
-|---|---|
-| `http_get` | Fetch a URL; cache body to disk; return preview |
-| `html_inspect` | Frequent tags / classes / ids in a page — pick the unit selector |
-| `html_extract` | Run a regex over cached HTML, see N matches |
-| `extract_text` | Universal text extractor: pdf, docx, pptx, xlsx, odt, rtf, epub, html, xml, json, jsonl, yaml, toml, csv, tsv, zip, tar, gz (recurses into archives). Magic-byte sniffing for extensionless files. |
-| `python` | Run a Python snippet in a fresh subprocess |
-| `bash` | Run a bash command (destructive ops blocked) |
-| `read_file` / `write_file` / `list_dir` | Workdir-scoped FS |
-| `dataset_append` / `dataset_stats` / `dataset_sample` | Manage the JSONL output |
-| `memory_set` / `memory_get` / `memory_list` | Persistent KV store |
-| `add_contract` / `contract_status` | Mutate the contract book |
-| `extract_structured` | LLM-driven JSON-schema extraction from prose |
-| `finish` | Declare done — only allowed when contracts pass |
+- **One tool call per turn.** Each step is auditable; the trace is a
+  flat JSONL of decisions.
+- **Re-rendered state brief** every turn instead of chat history. No
+  context drift, no stale observations.
+- **Phase-narrowed tool list.** The model sees 5–8 relevant tools per
+  turn, not 30 — small models behave dramatically better this way.
+- **Null-not-false discipline.** Booleans are `null` when the source is
+  silent. The system prompt forbids placeholder stuffing and the
+  contract checks surface low-cardinality "constants" as evidence.
+- **Deterministic IDs.** Bronze (raw harvest) and silver (typed
+  extraction) join by stable content-hash id — re-runs converge.
+- **Hysteresis.** Once the silver dataset is populated, the phase
+  machine refuses to fall back into harvest for marginal gains.
 
-### Why "contracts"?
+## Providers
 
-Small models love to call `finish` too early. They will declare victory after
-12 rows when you asked for 100, or skip the `points` field because it wasn't
-in the first response. Contracts solve this declaratively: `finish` is a
-no-op until every check returns `OK`. The agent reads the failing checks in
-its state brief on every turn, so the next action is always obvious.
+| Provider | What it gives you | Default model |
+|---|---|---|
+| **Ollama** | 100 % local, no API key | `gemma4:31b` (wizard shows your installed models) |
+| **OpenRouter** | Cheapest router for cloud models | `google/gemini-3.1-flash-lite` |
+| **Together AI** | Fast OSS models | `google/gemma-4-31b-it` |
+| **Featherless** | Serverless GPU for OSS models | `google/gemma-4-31b-it` |
+| Anything else | Any OpenAI-compatible endpoint via `--base-url` | — |
 
-### Why a state brief instead of full chat history?
+Run `gemma-miner providers` to print the full list.
 
-Small models drift when their context fills with stale observations. We
-re-render a compact brief each turn: goal + dataset progress + contract
-status + the last three turns. Everything else lives in `memory` (which the
-agent can query) or `dataset.jsonl` (which it can sample).
+## Push to Hugging Face
 
-## Storage convention for downloaded attachments
+After a run, push to a public dataset repo from inside the REPL:
 
-When the agent downloads files (PDFs, XML, CSV, images) and extracts their
-text, it is instructed to write them under a predictable, enumerable layout:
-
-```
-workdir/
-  dataset.jsonl
-  items/
-    item_0001/
-      meta.json
-      attachment_01.pdf
-      attachment_01.txt        ← extract_text output
-      attachment_02.xml
-      attachment_02.txt
-    item_0002/
-      ...
+```text
+› /push moncefem/my-cool-dataset
+✓ uploaded → https://huggingface.co/datasets/moncefem/my-cool-dataset
 ```
 
-This means every extracted corpus is trivially iterable:
+Or from the shell:
 
-```python
-from pathlib import Path
-for txt in sorted(Path("./runs/myrun/items").glob("*/attachment_*.txt")):
-    item_id = txt.parent.name        # "item_0001"
-    print(item_id, txt.read_text()[:120])
+```bash
+gemma-miner export-hf ./runs/hn/dataset.jsonl --repo-id you/hn-top100
 ```
 
-The instruction is baked into the system prompt and into the description of
-the `extract_text` tool, so small models reliably follow it.
+Needs `HF_TOKEN` (or `HUGGINGFACE_HUB_TOKEN`) in the environment and the
+`hf` extra installed.
 
 ## Safety
 
-- The `bash` and `python` tools refuse any input that matches a blocklist
-  (`rm`, `mv` to root, `dd`, `mkfs`, `sudo`, `chmod -R 777`, fork bombs, …).
-- File tools are confined to the workdir.
-- `http_get` does not follow `file://` schemes and caches everything inside
-  the workdir.
+- The `bash` and `python` tools refuse destructive operations (`rm`, `dd`,
+  `mkfs`, `sudo`, fork bombs, …) at the tool layer.
+- File operations are confined to the run's workdir.
+- The config file is `chmod 600` so API keys aren't readable by other
+  users on a shared machine.
 
-These are guardrails, not a sandbox. Don't run agent code on production
-boxes; use a container or VM.
+Don't run agent code on production boxes — use a container or VM.
+
+## Contributing
+
+Bugs, ideas, and pull requests welcome at
+<https://github.com/moncifem/gemma-miner>.
+
+The test suite runs offline:
+
+```bash
+uv pip install -e ".[dev]"
+pytest -q
+```
 
 ## License
 
-MIT.
+[Apache License 2.0](LICENSE).
+
+If you use Gemma Miner in a paper, project, or product, attribution to
+the upstream source and to Gemma Miner is appreciated:
+
+```bibtex
+@software{elmouden_gemma_miner_2025,
+  title  = {Gemma Miner: an autonomous text-to-dataset agent},
+  author = {EL-Mouden, Moncif and contributors},
+  year   = {2025},
+  url    = {https://github.com/moncifem/gemma-miner},
+}
+```
+
+---
+
+<div align="center">
+
+⛏ Made with care by <a href="https://huggingface.co/moncefem">Moncif EL-Mouden</a>.
+Powered by your favourite small open model.
+
+</div>
