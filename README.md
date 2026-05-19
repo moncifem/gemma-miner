@@ -48,13 +48,14 @@ without a second cleaning pass.
 
 ## See it in action
 
-Two real datasets built end-to-end by Gemma Miner — click through to read
+Three real datasets built end-to-end by Gemma Miner — click through to read
 their cards and load them:
 
 | Dataset | Rows × Cols | Source | Try it |
 |---|---|---|---|
 | 🇫🇷 [**CNIL Sanctions 2011-2025**](https://huggingface.co/datasets/moncefem/cnil-sanctions-2011-2025) | 374 × 34 | [cnil.fr](https://www.cnil.fr/fr/les-sanctions-prononcees-par-la-cnil) | `load_dataset("moncefem/cnil-sanctions-2011-2025")` |
 | 🧬 [**Clinical Trials of AI 2000-2025**](https://huggingface.co/datasets/moncefem/clinical-trials-ai-2000-2025) | 3 000 × 30 | [clinicaltrials.gov](https://clinicaltrials.gov) | `load_dataset("moncefem/clinical-trials-ai-2000-2025")` |
+| 🪶 [**Featherless.ai Model Catalog**](https://huggingface.co/datasets/moncefem/featherless-ai-models) | 300 × 20 | [featherless.ai](https://featherless.ai) | `load_dataset("moncefem/featherless-ai-models")` |
 
 ---
 
