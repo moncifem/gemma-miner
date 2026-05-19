@@ -70,7 +70,9 @@ PRESETS: dict[str, ProviderPreset] = {
     "featherless": ProviderPreset(
         name="featherless",
         base_url="https://api.featherless.ai/v1",
-        default_model="google/gemma-4-31b-it",
+        # Featherless is case-sensitive on model ids — use the exact slug
+        # they publish on featherless.ai (capital B in "31B").
+        default_model="google/gemma-4-31B-it",
         api_key_env="FEATHERLESS_API_KEY",
     ),
     # Generic OpenAI-compatible escape hatch — caller must pass base_url+model.

@@ -1345,8 +1345,10 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/clean-config",      "delete the stored config and re-run the wizard"),
     ("/datasets",          "list datasets produced in this workspace"),
     ("/workdir [<path>]",  "show or change the base workdir (./runs)"),
-    ("/provider [<name>]", "show or switch LLM provider (together/ollama/...)"),
-    ("/model [<id>]",      "show or switch model (remembered across runs)"),
+    ("/provider [<name>]", "pick the AGENT provider (no arg = interactive menu, or pass a name)"),
+    ("/model [<id>]",      "show or switch the AGENT model (remembered across runs)"),
+    ("/extract-provider [<name>]", "pick the EXTRACTION provider (the per-row codebook model)"),
+    ("/extract-model [<id>]",      "show or switch the EXTRACTION model"),
     ("/gemma-full-local",  "switch every phase to Ollama Gemma 31B (probes /api/tags)"),
     ("/resume <path>",     "resume a previous run (loads dataset + codebook + memory)"),
     ("/push <repo_id>",    "push the last run's dataset to Hugging Face"),
@@ -1549,9 +1551,15 @@ class REPL:
         self.last_workdir: Path | None = None
 
     def show_banner(self) -> None:
+        extract_line = ""
+        if (self.extraction_provider, self.extraction_model) != (self.provider, self.model):
+            extract_line = (
+                f"[dim]extract: {self.extraction_provider}/{self.extraction_model}[/dim]\n"
+            )
         console.print(Panel.fit(
             f"[bold cyan]gemma-miner[/bold cyan]  ·  text-to-dataset agent\n"
             f"[dim]model:  {self.provider}/{self.model}[/dim]\n"
+            f"{extract_line}"
             f"[dim]workdir: {self.base_workdir}[/dim]\n"
             f"[dim]type [white]/[/white] for commands, or just describe what you want.[/dim]\n"
             "[dim]paste long prompts: end the first line with [white]\"\"\"[/white]"
@@ -1663,37 +1671,43 @@ class REPL:
             else:
                 console.print(f"[cyan]workdir:[/cyan] {self.base_workdir}")
         elif cmd == "provider":
-            if arg:
-                # If the provider needs an API key and we don't have one,
-                # prompt now and save to config.
-                env_name = _cfg.PROVIDER_API_KEY_ENV.get(arg, "")
-                if env_name and not (os.environ.get(env_name) or _cfg.get_api_key(arg)):
-                    console.print(
-                        f"[yellow]No API key found for {arg} (env {env_name}).[/yellow]"
-                    )
-                    key = Prompt.ask(f"  paste your {arg} key", default="", password=True).strip()
-                    if key:
-                        _cfg.set_api_key(arg, key)
-                        os.environ[env_name] = key
-                # Pick a recent model for this provider if we have one.
-                recent = _cfg.get_recent_model(arg)
-                try:
-                    self.llm = make_llm(arg, model=recent)
-                    self.provider = arg
-                    self.model = self.llm.config.model
-                    _cfg.set_default_provider(arg)
-                    _cfg.set_recent_model(arg, self.model)
-                    console.print(
-                        f"[green]switched to {self.provider}/{self.model}[/green] "
-                        f"[dim](saved as default in config)[/dim]"
-                    )
-                except Exception as e:  # noqa: BLE001
-                    console.print(f"[red]could not switch: {e}[/red]")
-            else:
+            # No arg → interactive picker (numbered menu). Argument form
+            # `/provider together` still works as a quick switch.
+            if not arg:
                 console.print(
-                    f"[cyan]provider:[/cyan] {self.provider}  "
-                    f"[dim](choices: {', '.join(_cfg.SUPPORTED_PROVIDERS)})[/dim]"
+                    f"[dim]current:[/dim] [cyan]{self.provider}[/cyan]/"
+                    f"[cyan]{self.model}[/cyan]"
                 )
+                picked = _wizard_pick_provider(self.provider)
+                if picked == self.provider:
+                    console.print("[dim]unchanged[/dim]")
+                    return True
+                arg = picked
+            # If the provider needs an API key and we don't have one,
+            # prompt now and save to config.
+            env_name = _cfg.PROVIDER_API_KEY_ENV.get(arg, "")
+            if env_name and not (os.environ.get(env_name) or _cfg.get_api_key(arg)):
+                console.print(
+                    f"[yellow]No API key found for {arg} (env {env_name}).[/yellow]"
+                )
+                key = Prompt.ask(f"  paste your {arg} key", default="", password=True).strip()
+                if key:
+                    _cfg.set_api_key(arg, key)
+                    os.environ[env_name] = key
+            # Pick a recent model for this provider if we have one.
+            recent = _cfg.get_recent_model(arg)
+            try:
+                self.llm = make_llm(arg, model=recent)
+                self.provider = arg
+                self.model = self.llm.config.model
+                _cfg.set_default_provider(arg)
+                _cfg.set_recent_model(arg, self.model)
+                console.print(
+                    f"[green]switched to {self.provider}/{self.model}[/green] "
+                    f"[dim](saved as default in config)[/dim]"
+                )
+            except Exception as e:  # noqa: BLE001
+                console.print(f"[red]could not switch: {e}[/red]")
         elif cmd == "model":
             if arg:
                 try:
@@ -1707,6 +1721,61 @@ class REPL:
                     console.print(f"[red]could not switch: {e}[/red]")
             else:
                 console.print(f"[cyan]model:[/cyan] {self.model}")
+        elif cmd in ("extract-provider", "extraction-provider"):
+            # No arg → interactive picker; with arg → quick switch.
+            if not arg:
+                console.print(
+                    f"[dim]current extract:[/dim] "
+                    f"[cyan]{self.extraction_provider}[/cyan]/"
+                    f"[cyan]{self.extraction_model}[/cyan]"
+                )
+                picked = _wizard_pick_provider(self.extraction_provider)
+                if picked == self.extraction_provider:
+                    console.print("[dim]unchanged[/dim]")
+                    return True
+                arg = picked
+            # Prompt for API key if missing.
+            env_name = _cfg.PROVIDER_API_KEY_ENV.get(arg, "")
+            if env_name and not (os.environ.get(env_name) or _cfg.get_api_key(arg)):
+                console.print(
+                    f"[yellow]No API key found for {arg} (env {env_name}).[/yellow]"
+                )
+                key = Prompt.ask(f"  paste your {arg} key", default="", password=True).strip()
+                if key:
+                    _cfg.set_api_key(arg, key)
+                    os.environ[env_name] = key
+            recent = _cfg.get_recent_model(arg)
+            try:
+                # Validate the model is reachable on this provider before
+                # committing the switch — otherwise extraction blows up later.
+                test_llm = make_llm(arg, model=recent)
+                self.extraction_provider = arg
+                self.extraction_model = test_llm.config.model
+                _cfg.set_default_extract_provider(arg)
+                _cfg.set_recent_model(arg, self.extraction_model)
+                console.print(
+                    f"[green]extraction → {self.extraction_provider}/{self.extraction_model}[/green] "
+                    f"[dim](saved as default extract provider)[/dim]"
+                )
+            except Exception as e:  # noqa: BLE001
+                console.print(f"[red]could not switch extraction: {e}[/red]")
+        elif cmd in ("extract-model", "extraction-model"):
+            if arg:
+                try:
+                    test_llm = make_llm(self.extraction_provider, model=arg)
+                    self.extraction_model = test_llm.config.model
+                    _cfg.set_recent_model(self.extraction_provider, self.extraction_model)
+                    console.print(
+                        f"[green]extraction model → {self.extraction_model}[/green] "
+                        f"[dim](remembered for {self.extraction_provider})[/dim]"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    console.print(f"[red]could not switch: {e}[/red]")
+            else:
+                console.print(
+                    f"[cyan]extraction:[/cyan] "
+                    f"{self.extraction_provider}/{self.extraction_model}"
+                )
         elif cmd == "history":
             if not self.history:
                 console.print("[dim]no history yet[/dim]")

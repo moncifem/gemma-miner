@@ -138,7 +138,7 @@ PROVIDER_DEFAULT_MODEL: dict[str, str] = {
     "ollama":      "gemma4:31b",
     "openrouter":  "google/gemini-3.1-flash-lite",
     "together":    "google/gemma-4-31b-it",
-    "featherless": "google/gemma-4-31b-it",
+    "featherless": "google/gemma-4-31B-it",  # case-sensitive on Featherless
 }
 
 
