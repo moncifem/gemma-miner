@@ -226,6 +226,37 @@ def _required_field_names(state: "AgentState") -> list[str]:
     return required
 
 
+def _pick_signature_key(required: list[str]) -> str | None:
+    """Pick a single field whose value uniquely identifies a row, when
+    available. URL-like > id-like > first required field. Generic — applies
+    to any website that exposes a stable URL or id per item."""
+    if not required:
+        return None
+    low = [(f, f.lower()) for f in required]
+    for f, l in low:
+        if l.endswith("_url") or l == "url":
+            return f
+    for f, l in low:
+        if l.endswith("_id") or l == "id" or l.endswith("_slug"):
+            return f
+    return required[0]
+
+
+def _row_quality_score(row: dict, required: list[str]) -> float:
+    """Fraction of the user's required fields that are non-empty on this row.
+    Used as a quality gate so we can reject extractions where the model
+    returned shapes that don't match what the user asked for."""
+    if not required:
+        return 1.0
+    from gemma_miner.contracts import _field_variants, _is_meaningful
+    hit = 0
+    for f in required:
+        variants = _field_variants(f)
+        if any(_is_meaningful(row.get(v)) for v in variants):
+            hit += 1
+    return hit / len(required)
+
+
 def _normalize_optional_required_fields(row: dict, required: list[str]) -> dict:
     """Fill boolean fact fields with explicit negative values.
 
@@ -397,6 +428,8 @@ class LLMScrapeTool(Tool):
                 if len(rows) >= target:
                     break
 
+        # Compute net-new BEFORE the push runs (used to amend the headline).
+        existing_rows_count = len(state.dataset)
         out_lines = [
             f"llm_scrape: extracted {len(rows)} row(s) (target {target}) from "
             f"{len(chunks)} chunk(s) of {len(cleaned)} chars.",
@@ -430,6 +463,92 @@ class LLMScrapeTool(Tool):
                     "then try `extractor_define` with regex (faster + free) "
                     "or pass smaller `max_chars_per_chunk` for a retry."
                 )
+
+        # ── QUALITY GATE ──────────────────────────────────────────────────
+        # Generic check applicable to ANY website: if the user asked for
+        # specific fields (via FieldsContract) and the model extracted rows
+        # where most of those fields are null, the source most likely does
+        # not contain the requested data. Refuse the push and escalate so
+        # the agent fetches a different URL or finishes with an explicit
+        # "source lacks the data" summary, instead of accumulating garbage.
+        required_fields_for_gate = _required_field_names(state)
+        garbage_warning: str | None = None  # noqa: F841 — surfaced later
+        if required_fields_for_gate and rows:
+            scores = [_row_quality_score(r, required_fields_for_gate) for r in rows]
+            mean_quality = sum(scores) / len(scores)
+            empty_rows = sum(1 for s in scores if s == 0.0)
+            empty_frac = empty_rows / len(rows)
+            # >=80% of rows have NONE of the required fields → almost certainly
+            # the wrong shape (e.g. participant list when projects were asked).
+            if empty_frac >= 0.8:
+                # Track consecutive failures to escalate after the second one.
+                prev_fail = int(state.memory.get("_llm_scrape_consec_garbage", 0) or 0)
+                state.memory.set("_llm_scrape_consec_garbage", prev_fail + 1)
+                msg_lines = [
+                    f"llm_scrape: REJECTED — {empty_rows}/{len(rows)} extracted rows "
+                    f"have NONE of the user-required fields ({required_fields_for_gate}). "
+                    f"Mean required-field coverage: {mean_quality:.0%}.",
+                    "",
+                    "The source most likely does not contain the requested data, OR "
+                    "the model is reading the wrong section of the page. Do ONE of:",
+                    "  (a) http_get a DIFFERENT URL that actually lists the items "
+                    "      you want (project submissions, articles, etc.), OR",
+                    "  (b) extract a SAMPLE row with `html_inspect` / `html_find` to "
+                    "      verify the fields are actually on the page, OR",
+                    "  (c) if you have evidence the data does not exist here, call "
+                    "      `finish(force=true, summary='source URL does not contain "
+                    "      <fields>; data is unavailable')` to end the run honestly.",
+                ]
+                if prev_fail >= 1:
+                    msg_lines.append("")
+                    msg_lines.append(
+                        f"⚠ This is the {prev_fail + 1}{'nd' if prev_fail == 1 else 'rd+'} "
+                        "consecutive empty-quality extraction. Stop scraping this URL — "
+                        "fetch a different source or finish with force=true."
+                    )
+                _log_failure(state, kind="llm_scrape_quality_gate", payload={
+                    "n_rows": len(rows), "empty_rows": empty_rows,
+                    "mean_quality": mean_quality,
+                    "required_fields": required_fields_for_gate,
+                    "consec_failures": prev_fail + 1,
+                })
+                return ToolResult(output="\n".join(msg_lines), error=True,
+                                  artifact={"rows": rows, "rejected": True})
+            else:
+                # At least some rows are valid — clear the consecutive-failure
+                # counter so future legitimate empties don't compound.
+                state.memory.set("_llm_scrape_consec_garbage", 0)
+                if mean_quality < 0.5:
+                    garbage_warning = (
+                        f"⚠ Low extraction quality: mean required-field coverage "
+                        f"only {mean_quality:.0%} across {len(rows)} rows. "
+                        "Many rows will fail the FieldsContract — consider "
+                        "fetching a more targeted URL or re-running with a "
+                        "smaller `max_chars_per_chunk` so the model focuses."
+                    )
+
+        # If no rows were extracted at all from a multi-chunk page, that is
+        # also a hard failure (not a "retry quietly" condition).
+        if rows == [] and len(chunks) > 1:
+            prev_fail = int(state.memory.get("_llm_scrape_consec_empty", 0) or 0)
+            state.memory.set("_llm_scrape_consec_empty", prev_fail + 1)
+            if prev_fail >= 1:
+                return ToolResult(
+                    output=(
+                        "llm_scrape: REJECTED — zero rows extracted from "
+                        f"{len(chunks)} chunk(s), and this is the "
+                        f"{prev_fail + 1}{'nd' if prev_fail == 1 else 'rd+'} "
+                        "consecutive empty extraction on this source. "
+                        "Stop retrying llm_scrape on this URL. Options:\n"
+                        "  (a) fetch a different URL (paginate, follow links), OR\n"
+                        "  (b) finish(force=true, summary='source does not yield "
+                        "the requested items')."
+                    ),
+                    error=True,
+                    artifact={"rows": [], "rejected": True},
+                )
+        else:
+            state.memory.set("_llm_scrape_consec_empty", 0)
 
         # ── SOURCE-LOCK GUARDS ────────────────────────────────────────────
         # Once silver (extracted.jsonl) has rows, adding new bronze rows
@@ -504,26 +623,32 @@ class LLMScrapeTool(Tool):
             # Build a set of value-signatures from rows ALREADY in the dataset.
             # This prevents the model from inflating the dataset by calling
             # llm_scrape repeatedly with push_to_dataset=true.
-            existing = state.dataset.rows()
-            needed_new = max(0, target - len(existing))
-            existing_sigs: set[str] = set()
-            for r in existing:
-                existing_sigs.add(
-                    json.dumps(
-                        {k: r.get(k) for k in sorted(r.keys())
-                         if not k.startswith("_") and k != "id"},
-                        default=str, ensure_ascii=False,
-                    )
-                )
-            appended = 0
-            duplicates = 0
-            failures = 0
-            for i, r in enumerate(rows):
-                sig = json.dumps(
+            #
+            # Signature strategy: if the user gave us a "natural primary key"
+            # via FieldsContract (something URL-like or id-like), use it as
+            # the signature — that catches "same item re-scraped with slightly
+            # different cell values". Otherwise fall back to the full-row
+            # JSON signature. This is generic and works for any website that
+            # exposes a stable identifier per item.
+            primary_key = _pick_signature_key(required_fields)
+            def _sig(r: dict) -> str:
+                if primary_key:
+                    pk_val = r.get(primary_key)
+                    if pk_val not in (None, ""):
+                        return f"__pk__:{primary_key}={pk_val}"
+                return json.dumps(
                     {k: r.get(k) for k in sorted(r.keys())
                      if not k.startswith("_") and k != "id"},
                     default=str, ensure_ascii=False,
                 )
+            existing = state.dataset.rows()
+            needed_new = max(0, target - len(existing))
+            existing_sigs: set[str] = {_sig(r) for r in existing}
+            appended = 0
+            duplicates = 0
+            failures = 0
+            for i, r in enumerate(rows):
+                sig = _sig(r)
                 if sig in existing_sigs:
                     duplicates += 1
                     continue
@@ -548,16 +673,31 @@ class LLMScrapeTool(Tool):
                 f"failed: {failures}  "
                 f"total rows now: {len(state.dataset)}"
             )
+            # Promote the net-new count into the HEADLINE — small models
+            # focus on the first line and were missing the "appended" detail.
+            out_lines[0] = (
+                f"llm_scrape: NET-NEW {appended} row(s) added to dataset "
+                f"({duplicates} duplicates skipped). "
+                f"Extracted {len(rows)} from {len(chunks)} chunk(s); "
+                f"total now {len(state.dataset)}."
+            )
             if duplicates and appended == 0:
                 out_lines.append(
-                    "⚠ ALL rows were duplicates. Don't call llm_scrape on the "
-                    "SAME page again. Either:\n"
-                    "  (a) http_get a DIFFERENT URL (a real next page; if you "
-                    "      already tried ?page=2 and got the same content, "
-                    "      the site doesn't paginate that way), OR\n"
-                    "  (b) if you've collected ≥80% of the target, just call "
-                    "      `finish(summary=\"...\", force=true)` — partial "
-                    "      datasets are valid output."
+                    "🛑 ALL rows were duplicates. The same source has already "
+                    "been scraped — calling llm_scrape on it again will not "
+                    "help. Do ONE of:\n"
+                    "  (a) http_get a DIFFERENT URL (the next page if the "
+                    "site paginates), OR\n"
+                    "  (b) If you have enough rows, move on: codebook_propose, "
+                    "extract_items, then dataset_export, OR\n"
+                    "  (c) If the goal is reached, call finish(summary='...')."
+                )
+            elif duplicates > appended and appended > 0:
+                out_lines.append(
+                    f"⚠ More duplicates ({duplicates}) than new rows ({appended}). "
+                    "The page is mostly the same as last time — you're hitting "
+                    "diminishing returns. Move to codebook_propose / extract_items "
+                    "with what you have, OR fetch a different URL."
                 )
             elif needed_new and appended < needed_new and appended > 0:
                 out_lines.append(
@@ -568,4 +708,7 @@ class LLMScrapeTool(Tool):
                     "you have ≥80% of target, call finish(force=true)."
                 )
 
+        if garbage_warning:
+            out_lines.append("")
+            out_lines.append(garbage_warning)
         return ToolResult(output="\n".join(out_lines), artifact={"rows": rows})

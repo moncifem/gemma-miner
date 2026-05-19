@@ -231,7 +231,9 @@ class DatasetExportTool(Tool):
             if k not in var_names and not k.startswith("_")
         })
 
-        # Parquet
+        # Parquet — distinguish the missing-pyarrow case (RuntimeError raised
+        # by `_pa()`) from genuine schema/data mismatches. Either way, the
+        # JSONL exports still go through so the user gets a usable artifact.
         try:
             parquet_path = write_parquet(
                 rows,
@@ -239,11 +241,17 @@ class DatasetExportTool(Tool):
                 out_dir / f"{cb.name}.parquet",
                 extra_metadata_fields=tuple(extra_meta),
             )
+            parquet_err = None
         except RuntimeError as e:  # pyarrow missing
             parquet_path = None
-            parquet_err = str(e)
-        else:
-            parquet_err = None
+            parquet_err = f"pyarrow missing — {e}"
+        except Exception as e:  # noqa: BLE001 — schema/data mismatch, OOM, etc.
+            parquet_path = None
+            parquet_err = (
+                f"{type(e).__name__}: {e} — likely a codebook/data mismatch. "
+                "Inspect dataset_validate output; consider codebook_edit to drop "
+                "the offending variable or coerce its type."
+            )
 
         # Codebook MD
         stats = codebook_stats(rows, cb)

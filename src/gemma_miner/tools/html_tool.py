@@ -286,12 +286,25 @@ class HtmlInspectTool(Tool):
             html = _load_or_raise(src, state)
         except _SourceNotFoundError as e:
             return ToolResult(output=f"ERROR: {e}", error=True)
+        # Cap the analysed window. Files in the wild can be 5 MB+ (10 minute
+        # parses), and the top-N tag/class summary saturates fast — the
+        # marginal info from byte 1.5 MB+ is near zero.
+        MAX_SCAN = 1_500_000
+        full_len = len(html)
+        truncated = full_len > MAX_SCAN
+        scan = html[:MAX_SCAN] if truncated else html
         p = _StructParser()
         try:
-            p.feed(html)
+            p.feed(scan)
         except Exception as e:  # noqa: BLE001
             return ToolResult(output=f"ERROR parsing html: {e}", error=True)
-        lines = [f"html_size: {len(html)} chars", ""]
+        lines = [f"html_size: {full_len} chars", ""]
+        if truncated:
+            lines.append(
+                f"⚠ analysed the first {MAX_SCAN:,} chars (full file is "
+                f"{full_len:,}). Tag / class counts are from the scanned window only."
+            )
+            lines.append("")
         lines.append(f"--- top {top_n} tags ---")
         for t, n in p.tags.most_common(top_n):
             lines.append(f"  {n:6d}  <{t}>")
@@ -307,7 +320,9 @@ class HtmlInspectTool(Tool):
 
         # Sample block: show the first ~2.5 KB containing the most-frequent
         # *content* class so the model sees an actual row to base regexes on.
-        sample = _find_sample_block(html, p.classes)
+        # Always run against the SCANNED window (not the full file) — for
+        # huge files this is the difference between 1s and 10 min.
+        sample = _find_sample_block(scan, p.classes)
         if sample:
             lines.append("")
             lines.append(f"--- sample block (class='{sample[0]}', {len(sample[1])} chars) ---")

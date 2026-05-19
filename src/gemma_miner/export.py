@@ -135,9 +135,33 @@ def _coerce_for_arrow(value: Any, arrow_type: Any) -> Any:
         except (TypeError, ValueError):
             return None
     if pa.types.is_list(arrow_type):
-        if isinstance(value, list):
-            return value
-        return None
+        if not isinstance(value, list):
+            return None
+        item_type = arrow_type.value_type
+        # If the schema expects a list<struct> but the data is a list of
+        # scalars (common when the codebook designer typed an array as
+        # `{type:object, properties:{name}}` but the LLM returned bare strings),
+        # wrap each scalar as a {first_field: scalar} struct so pyarrow can
+        # build the column instead of raising `TypeError: string indices...`.
+        if pa.types.is_struct(item_type):
+            field_names = [item_type.field(i).name for i in range(item_type.num_fields)]
+            first = field_names[0] if field_names else None
+            coerced: list = []
+            for el in value:
+                if isinstance(el, dict):
+                    coerced.append(el)
+                elif el is None:
+                    coerced.append(None)
+                elif first is not None:
+                    coerced.append({first: str(el)})
+                else:
+                    coerced.append(None)
+            return coerced
+        # Plain list<scalar> — make sure each element is a string when the
+        # element type is string; pyarrow tolerates everything else.
+        if pa.types.is_string(item_type):
+            return [None if el is None else str(el) for el in value]
+        return value
     if pa.types.is_dictionary(arrow_type):
         return str(value) if value is not None else None
     if pa.types.is_string(arrow_type):

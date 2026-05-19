@@ -497,6 +497,19 @@ def current_phase(state: "AgentState", contract_min_rows: int | None = None) -> 
             if recent_errors >= 3:
                 return PHASES["EXPORT"]
 
+    # POST-EXTRACT EXIT: silver has been "completed" (either ≥90% of bronze
+    # or zero rows-left-to-try) and the agent is still calling extract_items
+    # over and over. Send it to EXPORT — the data won't get any better by
+    # re-running the same extraction.
+    if post_extract_done:
+        recent = state.history[-8:]
+        extract_replays = sum(
+            1 for h in recent
+            if h.tool == "extract_items"
+        )
+        if extract_replays >= 3:
+            return PHASES["EXPORT"]
+
     if n_rows >= target:
         codebook_path = Path(state.workdir) / "codebook.json"
         if not codebook_path.exists():

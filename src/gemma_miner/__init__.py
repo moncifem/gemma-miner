@@ -16,7 +16,7 @@ from gemma_miner.memory import Memory
 from gemma_miner.providers import PRESETS, list_providers, make_llm
 from gemma_miner.state import AgentState
 
-__version__ = "0.1.1"
+__version__ = "0.1.3"
 
 __all__ = [
     "Agent",

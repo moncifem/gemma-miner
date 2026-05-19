@@ -68,9 +68,11 @@ when unknown — that's what null is for).
 """
 
 
-# A row is "extractable" if its accessible source text crosses this threshold.
-# Below it, we don't call the LLM — we'd just be inventing data.
+# A row is "extractable" when its accessible source text crosses this
+# threshold OR it has enough populated structured fields for the codebook
+# to read. Below both, we don't call the LLM — we'd just be inventing data.
 _MIN_TEXT_CHARS = 200
+_MIN_STRUCTURED_FIELDS = 3
 
 
 def _parse_extraction_json(raw: str) -> dict | None:
@@ -320,12 +322,20 @@ class ExtractItemsTool(Tool):
             from gemma_miner.tools.codebook_tool import _row_text as _check_text
 
             text_for_check = _check_text(r, str(state.workdir))
-            if not text_for_check or len(text_for_check) < _MIN_TEXT_CHARS:
+            n_structured = sum(
+                1 for k, v in r.items()
+                if not str(k).startswith("_") and k != "id"
+                and v not in (None, "", [], {})
+            )
+            text_ok = bool(text_for_check) and len(text_for_check) >= _MIN_TEXT_CHARS
+            structured_ok = n_structured >= _MIN_STRUCTURED_FIELDS
+            if not text_ok and not structured_ok:
                 if r.get("id") is not None:
                     skip_row = {
                         "id": r["id"],
                         "_extract_status": "no_text",
                         "_extract_text_chars": len(text_for_check or ""),
+                        "_n_structured_fields": n_structured,
                     }
                     extracted_ds.upsert(skip_row)
                 skipped_no_text += 1
@@ -432,14 +442,24 @@ class ExtractItemsTool(Tool):
                 )
                 state.memory.set("last_extracted_codebook_variables", var_names)
 
-            # Sticky post-extract flag for the phase machine's hysteresis rule:
-            # set it as soon as silver covers ≥90% of bronze and the pilot is
-            # NOT the only thing that ran. The flag is observed in phases.py
-            # to refuse falling back into ENUMERATE/PROCESS for marginal gains.
+            # Sticky post-extract flag for the phase machine's hysteresis
+            # rule. Two trigger conditions, either qualifies:
+            #   1. Silver covers ≥90% of bronze — the "happy" case.
+            #   2. We've processed everything we COULD (no rows remain to try),
+            #      regardless of skip-rate. This stops the loop where the
+            #      agent re-scrapes for fresh bronze trying to fix rows that
+            #      are intrinsically too thin to extract.
             if not is_pilot_run:
                 bronze_n = len(state.dataset)
                 silver_n = len(extracted_ds)
-                if bronze_n > 0 and silver_n >= max(1, int(bronze_n * 0.9)):
+                rows_left = sum(
+                    1 for r in rows
+                    if str(r.get("id")) not in existing_extracted_ids
+                )
+                if bronze_n > 0 and (
+                    silver_n >= max(1, int(bronze_n * 0.9))
+                    or rows_left == 0
+                ):
                     state.memory.set("_post_extract_done", True)
 
         out = [

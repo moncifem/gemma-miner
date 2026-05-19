@@ -1,6 +1,6 @@
 [project]
 name = "gemma-miner"
-version = "0.1.1"
+version = "0.1.3"
 description = "An autonomous text-to-dataset agent — turns any website or document corpus into a typed, research-grade dataset in minutes. Works with Gemma, Llama, Gemini, GPT and any OpenAI-compatible model."
 readme = "README.md"
 requires-python = ">=3.10"

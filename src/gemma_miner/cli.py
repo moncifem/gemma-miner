@@ -740,11 +740,11 @@ def _run_with_live_feed(
 
     contracts: list = []
     if min_rows > 0:
-        contracts.append(MinRowsContract(min_rows=min_rows))
+        contracts.append(MinRowsContract(min_rows=min_rows, user_locked=True))
     if required_fields:
-        contracts.append(FieldsContract(required_fields=required_fields))
+        contracts.append(FieldsContract(required_fields=required_fields, user_locked=True))
     if unique_field:
-        contracts.append(UniqueFieldContract(field=unique_field))
+        contracts.append(UniqueFieldContract(field=unique_field, user_locked=True))
     if want_codebook:
         contracts.append(CodebookContract(min_variables=20, min_numeric_or_boolean_ratio=0.5))
 
@@ -1473,7 +1473,10 @@ def _build_pt_session():
         multiline=False,
         style=style,
         key_bindings=kb,
-        mouse_support=True,
+        # Mouse capture would hijack the trackpad — you'd lose native scroll
+        # and click-to-select-text in the terminal. Keep it off; the slash
+        # menu works fine with keyboard nav (arrows + Enter).
+        mouse_support=False,
         bottom_toolbar=lambda: HTML(
             ' <b>/</b> commands  ·  <b>"""</b> heredoc  ·  '
             '<b>\\</b> line-continue  ·  <b>↑↓</b> history'
@@ -2011,12 +2014,12 @@ def run_cmd(
     _setup_logging(logging.INFO)
     contracts = []
     if min_rows > 0:
-        contracts.append(MinRowsContract(min_rows=min_rows))
+        contracts.append(MinRowsContract(min_rows=min_rows, user_locked=True))
     if required_fields.strip():
         fields = [f.strip() for f in required_fields.split(",") if f.strip()]
-        contracts.append(FieldsContract(required_fields=fields))
+        contracts.append(FieldsContract(required_fields=fields, user_locked=True))
     if unique_field.strip():
-        contracts.append(UniqueFieldContract(field=unique_field.strip()))
+        contracts.append(UniqueFieldContract(field=unique_field.strip(), user_locked=True))
     if not no_codebook:
         contracts.append(CodebookContract(min_variables=20))
     schema = json.loads(Path(schema_file).read_text()) if schema_file else None

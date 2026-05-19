@@ -1,10 +1,12 @@
 """Contracts: declarative requirements the agent must satisfy before finishing.
 
 A contract has a `check(dataset)` method that returns (ok, message). The agent
-loop refuses to terminate until every contract returns ok=True. New contracts
-can be added mid-run via the `add_contract` tool, which lets the user (or the
-agent itself) tighten the spec during execution — "actually I need 200 rows,
-not 100" is just an addContract call.
+loop refuses to terminate until every contract returns ok=True.
+
+Contracts created from the user's CLI args (MinRows, Fields, UniqueField) are
+marked `user_locked=True`. Once locked, no tool can silently replace, weaken,
+or remove them — the agent must satisfy the user's brief OR call
+`finish(force=true, summary=...)` with an explicit explanation.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ class MinRowsContract(Contract):
 
     min_rows: int
     name: str = "min_rows"
+    user_locked: bool = False
 
     @property
     def description(self) -> str:  # type: ignore[override]
@@ -138,6 +141,7 @@ class FieldsContract(Contract):
 
     required_fields: list[str]
     name: str = "required_fields"
+    user_locked: bool = False
 
     @property
     def description(self) -> str:  # type: ignore[override]
@@ -183,6 +187,7 @@ class UniqueFieldContract(Contract):
 
     field: str
     name: str = "unique_field"
+    user_locked: bool = False
 
     @property
     def description(self) -> str:  # type: ignore[override]
@@ -300,14 +305,38 @@ class ContractBook:
         self._contracts: list[Contract] = list(contracts or [])
 
     def add(self, contract: Contract) -> None:
-        # replace any existing contract with the same name
+        existing = next((c for c in self._contracts if c.name == contract.name), None)
+        if existing is not None and getattr(existing, "user_locked", False):
+            # Don't silently replace a user-locked contract. The whole point
+            # of `user_locked=True` is to prevent contract-gaming where the
+            # agent weakens the user's brief to "satisfy" it.
+            raise PermissionError(
+                f"contract '{contract.name}' is user_locked and cannot be replaced; "
+                "call finish(force=true) with a summary explaining why the brief cannot be met."
+            )
         self._contracts = [c for c in self._contracts if c.name != contract.name]
         self._contracts.append(contract)
 
     def remove(self, name: str) -> bool:
+        existing = next((c for c in self._contracts if c.name == name), None)
+        if existing is not None and getattr(existing, "user_locked", False):
+            raise PermissionError(
+                f"contract '{name}' is user_locked and cannot be removed."
+            )
         n = len(self._contracts)
         self._contracts = [c for c in self._contracts if c.name != name]
         return len(self._contracts) < n
+
+    def locked_required_fields(self) -> set[str]:
+        """Return the union of every required-field name protected by a
+        user-locked FieldsContract. Used by other tools (codebook_edit,
+        llm_scrape) to refuse mutations that would erase user-required data.
+        """
+        out: set[str] = set()
+        for c in self._contracts:
+            if isinstance(c, FieldsContract) and c.user_locked:
+                out.update(c.required_fields)
+        return out
 
     def list(self) -> list[Contract]:
         return list(self._contracts)

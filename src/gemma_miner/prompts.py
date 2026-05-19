@@ -522,10 +522,25 @@ def render_state_brief(state: "AgentState", registry: "ToolRegistry") -> str:
     last8 = state.history[-8:]
     fail_counts: dict[str, int] = {}
     sample_obs: dict[str, str] = {}
+    # A "soft failure" is a call that didn't raise but produced nothing useful
+    # — e.g. extractor_define matching 0 rows, scrape_paginated adding 0,
+    # extract_items processing 0 rows. These are the silent thrash patterns.
+    SOFT_FAIL_MARKERS = (
+        "matched_rows: 0",
+        "total_added: 0",
+        "processed=0 ",
+        "appended to dataset: 0",
+        "extracted 0 row",
+        "nothing to do",
+    )
     for h in last8:
-        if h.error and h.tool and not h.tool.startswith("_"):
+        if not h.tool or h.tool.startswith("_"):
+            continue
+        obs = h.observation or ""
+        soft_fail = any(m in obs for m in SOFT_FAIL_MARKERS)
+        if h.error or soft_fail:
             fail_counts[h.tool] = fail_counts.get(h.tool, 0) + 1
-            sample_obs.setdefault(h.tool, (h.observation or "")[:200])
+            sample_obs.setdefault(h.tool, obs[:200])
     repeated_failures = [(t, c) for t, c in fail_counts.items() if c >= 3]
     if repeated_failures:
         alt_hints = {
@@ -588,6 +603,41 @@ def render_state_brief(state: "AgentState", registry: "ToolRegistry") -> str:
             f"\n# ⚠️  {len(state.history)} TURNS, ZERO ROWS — files on disk don't count. "
             "Call dataset_append (or process_queue / scrape_paginated) to advance.\n"
         )
+
+    # BRONZE CHURN DETECTOR: dataset row count flips up/down repeatedly,
+    # which means the agent is re-harvesting the same source with slightly
+    # different settings, producing a different shape each time. Mixed
+    # shapes = unusable downstream. Tell the agent to stop.
+    churn_warning = ""
+    if "_row_count_history" not in state.memory.keys():
+        state.memory.set("_row_count_history", [])
+    rc_hist = list(state.memory.get("_row_count_history") or [])
+    current_n = int(brief["dataset_rows"] or 0)
+    if not rc_hist or rc_hist[-1] != current_n:
+        rc_hist.append(current_n)
+        if len(rc_hist) > 12:
+            rc_hist = rc_hist[-12:]
+        try:
+            state.memory.set("_row_count_history", rc_hist)
+        except Exception:  # noqa: BLE001
+            pass
+    if len(rc_hist) >= 5:
+        recent_counts = rc_hist[-6:]
+        flips = sum(
+            1 for i in range(2, len(recent_counts))
+            if (recent_counts[i] > recent_counts[i - 1]) != (recent_counts[i - 1] > recent_counts[i - 2])
+        )
+        if flips >= 2:
+            churn_warning = (
+                "\n# 🛑  BRONZE CHURN DETECTED — row count went "
+                + " → ".join(str(n) for n in recent_counts)
+                + " over the last few turns. The dataset shape is changing each "
+                + "harvest, which means downstream extraction will be inconsistent.\n"
+                + "  STOP scraping. Either:\n"
+                + "    • call dataset_export with the current rows, OR\n"
+                + "    • dataset_sample to see what's already there, OR\n"
+                + "    • set_plan to re-lock the strategy, then ONE final harvest with force=true.\n"
+            )
 
     # Verification hint, if the agent is re-entering the loop after a failed verify.
     verify_hint = state.memory.get("_verify_hint")
@@ -682,6 +732,7 @@ def render_state_brief(state: "AgentState", registry: "ToolRegistry") -> str:
         + "\n".join(history_block)
         + loop_warning
         + no_progress
+        + churn_warning
         + "\n\n"
         "# What to do next\n"
         "Pick ONE tool from the phase list (or an escape hatch if truly needed) "

@@ -11,7 +11,7 @@ import json
 import random
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from gemma_miner.codebook import Codebook, VariableSpec
 from gemma_miner.parsing import _candidates, _strip_trailing_commas, _repair_invalid_escapes
@@ -98,13 +98,22 @@ statistics, machine learning, and public release.
 
 RULES:
 1. Propose 20–60 variables.
-2. At least 60% MUST be NUMERIC (integer/float) or BOOLEAN. Strings are
-   reserved for IDs, names, and short categorical labels.
-3. Use ENUMS for any categorical dimension with a small fixed set of values.
-4. Use DATES (YYYY-MM-DD) for every time fact.
-5. Each variable needs a clear ONE-SENTENCE description.
-6. Only include variables PLAUSIBLY extractable from the documents you saw.
-7. Cover the full dimensionality: counts, dates, amounts, categories,
+2. Aim for ≥50% NUMERIC (integer/float) or BOOLEAN variables when the source
+   plausibly supports counts, dates, amounts, or boolean facts. If the
+   USER'S REQUIRED FIELDS are mostly identifiers / titles / descriptions
+   (i.e. metadata extraction), prefer STRING/ENUM variables that match the
+   user's brief over inventing speculative booleans. Never invent a variable
+   that cannot be answered from the sampled text — placeholder booleans like
+   `is_fintech` on a generic listing page produce all-null columns and bias
+   downstream stats.
+3. ALWAYS include the user's required fields verbatim (same exact names),
+   when supplied. They are the contract; the rest of the codebook is
+   additional structure.
+4. Use ENUMS for any categorical dimension with a small fixed set of values.
+5. Use DATES (YYYY-MM-DD) for every time fact.
+6. Each variable needs a clear ONE-SENTENCE description.
+7. Only include variables PLAUSIBLY extractable from the documents you saw.
+8. Cover the full dimensionality: counts, dates, amounts, categories,
    boolean facts, identifiers, severities, party roles, outcomes.
 
 NAMING CONVENTIONS:
@@ -254,6 +263,17 @@ class CodebookProposeTool(Tool):
             user_lines.append(f"DOMAIN HINT: {args['domain_hint']}")
         if args.get("feedback"):
             user_lines.append("FEEDBACK ON PREVIOUS PROPOSAL: " + str(args["feedback"]))
+        # Surface the user's required-field contract so the proposer cannot
+        # ignore the user's brief. Generic — applies to any website / domain.
+        try:
+            required_from_contract = sorted(state.contracts.locked_required_fields())
+        except Exception:  # noqa: BLE001
+            required_from_contract = []
+        if required_from_contract:
+            user_lines.append(
+                "USER REQUIRED FIELDS (must appear verbatim in the codebook): "
+                + ", ".join(required_from_contract)
+            )
         user_lines.append(f"\nGoal: {state.goal}\n")
         for iid, text in item_texts:
             user_lines.append(f"\n=== SAMPLE ITEM {iid} ===\n{text}\n")
@@ -491,8 +511,26 @@ class CodebookEditTool(Tool):
             return ToolResult(output="ERROR: no codebook saved", error=True)
         op = args.get("operation")
         silver_migration: dict[str, Any] = {}
+        # User-locked required fields cannot be dropped/renamed via codebook_edit.
+        # The user named these in their brief; weakening them silently is contract
+        # gaming. Generic — works for any website / any user-supplied field set.
+        locked_fields: set[str] = set()
+        try:
+            locked_fields = state.contracts.locked_required_fields()
+        except Exception:  # noqa: BLE001
+            locked_fields = set()
         if op == "drop":
             names = args.get("names") or []
+            blocked = [n for n in names if n in locked_fields]
+            if blocked:
+                return ToolResult(
+                    output=(
+                        f"ERROR: refused — cannot drop user-locked required field(s): {blocked}. "
+                        "These fields are part of the user's brief; the run must satisfy them or "
+                        "call finish(force=true) with a summary explaining why."
+                    ),
+                    error=True,
+                )
             removed = []
             for n in names:
                 if cb.remove_variable(n):
@@ -504,6 +542,16 @@ class CodebookEditTool(Tool):
                 silver_migration = {"silver_rows_touched": touched, **summary}
         elif op == "rename":
             renames = args.get("renames") or {}
+            blocked = [k for k in renames.keys() if k in locked_fields]
+            if blocked:
+                return ToolResult(
+                    output=(
+                        f"ERROR: refused — cannot rename user-locked required field(s): {blocked}. "
+                        "These names are part of the user's brief and must appear unchanged in "
+                        "the final dataset."
+                    ),
+                    error=True,
+                )
             done = []
             for old, new in renames.items():
                 v = cb.variable(old)

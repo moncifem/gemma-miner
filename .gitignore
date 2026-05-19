@@ -22,6 +22,9 @@ venv/
 .vscode/
 .DS_Store
 
+# ── Local-only working dirs (slides, notes, scratch) ───────────────────
+presentation/
+
 # ── Agent run outputs (datasets, traces, cache) ────────────────────────
 # Each run produces a workdir under ./runs/<slug>/ with the harvested
 # dataset, cache, codebook and trace logs. Commit datasets you want to
