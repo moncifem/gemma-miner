@@ -267,6 +267,8 @@ PHASES: dict[str, Phase] = {
             "llm_scrape",
             "html_find",
             "html_inspect",
+            "field_probe",
+            "pagination_probe",
             "python",
         ),
         hint=(
@@ -276,7 +278,11 @@ PHASES: dict[str, Phase] = {
             "  • what one row represents,\n"
             "  • which fields are visible on the listing,\n"
             "  • whether you'll need a detail page per item, attachments, or neither.\n\n"
-            "STEP 3 — WRITE A SPEC (or call llm_scrape for messy HTML, or python\n"
+            "STEP 2.5 — if fields are unclear, call field_probe(values=['sample value 1', ...])\n"
+            "to find WHERE each field appears in the cached HTML before writing the extractor spec.\n\n"
+            "STEP 3 — if pagination is unclear, call pagination_probe(base_url=...) to discover\n"
+            "the correct URL pattern before committing.\n\n"
+            "STEP 4 — WRITE A SPEC (or call llm_scrape for messy HTML, or python\n"
             "for JSON APIs). Phase done when ≥1 row is matched and visible fields\n"
             "are non-null."
         ),
@@ -292,6 +298,7 @@ PHASES: dict[str, Phase] = {
             "queue_status",
             "queue_add",
             "http_get",
+            "pagination_probe",
             "python",
             "read_file",
             "show_plan",
@@ -302,8 +309,21 @@ PHASES: dict[str, Phase] = {
             "  scrape_paginated(\n"
             "    url_template='<base>?page={page}',\n"
             "    extractor_name='listing',\n"
+            "    start_page=<1 unless you've verified ?page=0 returns rows>,\n"
+            "    max_pages=<ceil(plan.target_rows / plan.items_per_page) + a few>,\n"
             "    target_count=<plan.target_rows>\n"
             "  )\n\n"
+            "SIZING — defaults will sandbag you. start_page defaults to 0 and\n"
+            "max_pages defaults to 20 (≈ 840 rows at 42/page). If your plan needs\n"
+            "more than that, you MUST pass max_pages explicitly. Compute it from\n"
+            "the plan: pages_needed = ceil(target_rows / items_per_page).\n\n"
+            "INDEXING — most paginated sites are 1-indexed (page=1 is the first\n"
+            "real page; page=0 returns empty or a redirect). The base URL with\n"
+            "NO ?page param is usually equivalent to page=1, so compare it to\n"
+            "?page=1 and ?page=2 in cache to confirm. If your first call returns\n"
+            "`total_added: 0` AND the base URL had real rows, your start_page is\n"
+            "wrong — RE-CALL scrape_paginated with start_page=1, do NOT fall back\n"
+            "to llm_scrape on the same cached page (it just re-reads page 1).\n\n"
             "For non-`{page}` pagination (cursor, offset+limit, next-token), write\n"
             "a Python loop calling http_get per page and dataset_append the rows in\n"
             "one batch at the end. DO NOT re-implement pagination when\n"

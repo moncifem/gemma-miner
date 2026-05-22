@@ -102,10 +102,34 @@ def write_parquet(
     for r in rows:
         for f in schema:
             columns[f.name].append(_coerce_for_arrow(r.get(f.name), f.type))
-    table = pa.table(columns, schema=schema)
+
+    # Build the table column-by-column so a single bad field doesn't crash the
+    # whole export. Drop the offending column and surface a clear error instead
+    # of a cryptic "string indices must be integers" traceback.
+    bad_fields: list[str] = []
+    arrays: dict[str, Any] = {}
+    for f in schema:
+        try:
+            arrays[f.name] = pa.array(columns[f.name], type=f.type)
+        except Exception as e:  # noqa: BLE001
+            bad_fields.append(f.name)
+            # Emit nulls for the bad column so the rest of the table is intact.
+            arrays[f.name] = pa.array([None] * len(rows), type=f.type)
+
+    clean_schema = pa.schema([f for f in schema if f.name not in bad_fields]
+                             + [f for f in schema if f.name in bad_fields])
+    table = pa.table({f.name: arrays[f.name] for f in schema}, schema=schema)
+
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, out_path, compression="snappy")
+
+    if bad_fields:
+        raise ValueError(
+            f"Parquet written but {len(bad_fields)} column(s) exported as null "
+            f"due to type errors: {bad_fields}. "
+            "Use codebook_edit to drop or retype these variables, then re-export."
+        )
     return out_path
 
 
