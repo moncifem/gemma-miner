@@ -23,10 +23,13 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
+import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import typer
@@ -37,11 +40,11 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.rule import Rule
-from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
 from gemma_miner.agent import AgentConfig, run_agent
+from gemma_miner.tools.registry import default_registry
 from gemma_miner.contracts import (
     CodebookContract,
     FieldsContract,
@@ -88,6 +91,74 @@ DEFAULT_EXTRACTION_PROVIDER = _resolved_default_extract_provider()
 DEFAULT_EXTRACTION_MODEL = (
     _resolved_default_extract_model() or "google/gemini-3.1-flash-lite"
 )
+
+
+# ── spinner animation ───────────────────────────────────────────────────────
+
+# Braille-dot spinner — the classic subtle indicator, barely distracting.
+_GLYPH_FRAMES: tuple[str, ...] = (
+    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+)
+
+_SPINNER_VERBS: tuple[str, ...] = (
+    # reasoning
+    "Reasoning", "Thinking", "Planning", "Mapping", "Inferring",
+    # scraping
+    "Crawling", "Scraping", "Fetching", "Browsing", "Navigating", "Spidering",
+    # extraction
+    "Extracting", "Mining", "Harvesting", "Parsing", "Collecting", "Gathering",
+    # processing
+    "Distilling", "Refining", "Structuring", "Processing", "Analyzing",
+    # dataset
+    "Indexing", "Curating", "Cataloging", "Labeling", "Classifying",
+)
+
+
+def _glimmer_text(label: str, t: float) -> "Text":
+    import re as _re
+    plain = _re.sub(r"\[.*?\]", "", label)
+    n = max(len(plain), 1)
+    crest = (t * 10.0) % (n + 8) - 4
+    out = Text()
+    for i, ch in enumerate(plain):
+        d = abs(i - crest)
+        if d < 0.8:
+            out.append(ch, style="bold bright_white")
+        elif d < 2.2:
+            out.append(ch, style="#a8e6ff")
+        else:
+            out.append(ch, style="#4fc3f7")
+    return out
+
+
+def _shimmer_text(label: str, t: float) -> "Text":
+    return _glimmer_text(label, t)
+
+
+class _GlimmerSpinnerRenderable:
+    """Rich renderable for the REPL chat spinner."""
+
+    def __init__(self) -> None:
+        import random
+        self._verb = random.choice(_SPINNER_VERBS)
+        self._verb_until = time.time() + 8.0
+
+    def __rich_console__(self, console: "Console", options: Any) -> Any:
+        t = time.time()
+        if t >= self._verb_until:
+            import random
+            self._verb = random.choice(_SPINNER_VERBS)
+            self._verb_until = t + 8.0
+        glyph = _GLYPH_FRAMES[int(t * 16) % len(_GLYPH_FRAMES)]
+        label = f"{self._verb}…"
+        out = Text()
+        out.append(f"  {glyph} ", style="color(38)")
+        out.append_text(_glimmer_text(label, t))
+        yield out
+
+
+def _shimmer_spinner_renderable() -> "_GlimmerSpinnerRenderable":
+    return _GlimmerSpinnerRenderable()
 
 
 # ── tool palette ────────────────────────────────────────────────────────────
@@ -380,14 +451,17 @@ def _auto_workdir(prompt: str, url: str | None, base: Path) -> Path:
 class ActivityFeed:
     """Renders the live state of an agent run as a Rich Group."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_turns: int = 120, registry: Any = None) -> None:
         self.steps: list[Any] = []
         self.step_count = 0
+        self.max_turns = max_turns
         self.start = time.time()
-        self.spinner = Spinner("dots", text=Text("starting…", style="cyan"))
         self.spinner_label = "starting…"
         self.spinner_started = time.time()
         self.spinner_active = True
+        # Verb rotation: pick a new fun verb every 8 s while "thinking"
+        self._verb: str = ""
+        self._verb_until: float = 0.0
         # current phase + dataset progress (rendered in the status bar)
         self.phase = ""
         self.rows = 0
@@ -396,6 +470,8 @@ class ActivityFeed:
         # in-flight tool calls: index → start_ts
         self._inflight: list[float] = []
         self.live: Any = None
+        # optional tool registry for looking up summary_fields
+        self._registry = registry
         self._graduated: set[int] = set()
 
     # ── feed input ─────────────────────────────────────────────────────────
@@ -539,6 +615,7 @@ class ActivityFeed:
         elapsed_ms = ev.get("elapsed_ms") or 0
         contracts = ev.get("contracts") or []
         n_rows = ev.get("n_rows", 0)
+        thought = (ev.get("thought") or "").strip()
 
         self.step_count = max(self.step_count, turn)
         self.rows = n_rows
@@ -546,15 +623,31 @@ class ActivityFeed:
 
         call_line = self._tool_call_line(turn, tool, args)
         result_line = self._result_renderable(tool, observation, is_error, elapsed_ms)
-        block = Group(call_line, result_line)
+        # Show thought for real tool calls (not internal pseudo-tools).
+        if thought and tool not in ("_llm", "_parse"):
+            thought_line = Text.from_markup(
+                f"       [dim italic]{_short(thought, 120)}[/dim italic]"
+            )
+            block = Group(thought_line, call_line, result_line)
+        else:
+            block = Group(call_line, result_line)
         # Add and immediately graduate completed blocks to keep live region small.
         idx = len(self.steps)
         self.steps.append(block)
         self._graduate(idx)
-        self.set_thinking("thinking…")
+        self.set_thinking("thinking…", rotate_verb=True)
 
-    def set_thinking(self, label: str) -> None:
-        self.spinner_label = label
+    def set_thinking(self, label: str, *, rotate_verb: bool = False) -> None:
+        if rotate_verb and "thinking" in label.lower():
+            # Keep the current verb if it hasn't expired; pick a new one otherwise.
+            now = time.time()
+            if now >= self._verb_until or not self._verb:
+                import random
+                self._verb = random.choice(_SPINNER_VERBS)
+                self._verb_until = now + 8.0
+            self.spinner_label = f"{self._verb}…"
+        else:
+            self.spinner_label = label
         self.spinner_started = time.time()
         self.spinner_active = True
 
@@ -563,14 +656,16 @@ class ActivityFeed:
 
     # ── rendering ──────────────────────────────────────────────────────────
 
-    def _live_spinner(self) -> Spinner:
-        elapsed = time.time() - self.spinner_started
-        try:
-            label_part = Text.from_markup(self.spinner_label, style="cyan")
-        except Exception:  # noqa: BLE001
-            label_part = Text(self.spinner_label, style="cyan")
-        self.spinner.text = Text.assemble(label_part, (f"  ({elapsed:.1f}s)", "dim"))
-        return self.spinner
+    def _live_spinner(self) -> Text:
+        t = time.time()
+        elapsed = t - self.spinner_started
+        glyph = _GLYPH_FRAMES[int(t * 16) % len(_GLYPH_FRAMES)]
+        label = self.spinner_label
+        out = Text()
+        out.append(f"  {glyph} ", style="color(38)")
+        out.append_text(_glimmer_text(label, t))
+        out.append(f"  ({elapsed:.1f}s)", style="dim")
+        return out
 
     def _status_bar(self) -> Text:
         elapsed = int(time.time() - self.start)
@@ -590,9 +685,10 @@ class ActivityFeed:
         rows_part = f"raw {self.rows}"
         if self.extracted_rows:
             rows_part += f"  [dim]·[/dim]  extracted {self.extracted_rows}"
+        step_part = f"step {self.step_count}/{self.max_turns}"
         return Text.from_markup(
             f"  phase: {phase_part}  [dim]·[/dim]  "
-            f"step {self.step_count}  [dim]·[/dim]  "
+            f"{step_part}  [dim]·[/dim]  "
             f"{rows_part}  [dim]·[/dim]  "
             f"{m}m{s:02d}s" + c_part
         )
@@ -634,13 +730,18 @@ class ActivityFeed:
         )
 
     def _result_renderable(self, name: str, content: str, is_error: bool, elapsed_ms: float) -> Any:
-        # Errors are tracked silently in failures.log; the live feed only
-        # shows a muted "retrying…" hint so the user isn't drowning in red.
+        # Errors: show a muted amber hint with the first meaningful error line
+        # so the user understands what's wrong without drowning in red.
         ms = f"  · {elapsed_ms / 1000.0:.1f}s" if elapsed_ms else ""
         if is_error:
+            first_line = next(
+                (l.strip() for l in (content or "").splitlines() if l.strip()), ""
+            )
+            first_line = re.sub(r"^ERROR:\s*", "", first_line, flags=re.IGNORECASE)
+            error_text = _short(first_line, 160) if first_line else "retrying with a different approach"
             return Text.assemble(
                 ("    ↻ ", "dim yellow"),
-                (f"{name} retrying with a different approach", "dim"),
+                (error_text, "dim yellow"),
                 (ms, "dim"),
             )
         summary = self._inline_summary(name, content)
@@ -663,27 +764,14 @@ class ActivityFeed:
             return "ok"
         text = content.strip()
 
-        # Many tools use a `key: value` header; capture the most useful one.
-        priorities = {
-            "http_get":          ["status", "bytes"],
-            "html_inspect":      ["html_size"],
-            "html_extract":      ["total_matches"],
-            "extractor_define":  ["matched_rows", "saved"],
-            "scrape_paginated":  ["queue_len", "total_added"],
-            "process_queue":     ["appended", "remaining_in_queue"],
-            "dataset_append":    ["added", "total_rows_now"],
-            "dataset_stats":     ["rows"],
-            "extract_items":     ["processed"],
-            "extract_text":      ["text_chars", "n_pages"],
-            "save_attachment":   ["attachment_path", "text_chars"],
-            "codebook_propose":  ["variables", "type breakdown"],
-            "codebook_test":     ["dataset", "numeric_or_boolean_ratio"],
-            "dataset_export":    ["export →", "parquet"],
-            "queue_status":      ["queue_len", "remaining"],
-            "queue_add":         ["queue_add"],
-            "queue_next":        [""],
-        }
-        wants = priorities.get(name) or []
+        # Look up summary_fields from the tool (if registry is available),
+        # falling back to empty so any first line is used.
+        wants: tuple[str, ...] = ()
+        if self._registry is not None:
+            tool = self._registry.get(name)
+            if tool is not None:
+                wants = getattr(tool, "summary_fields", ())
+
         parts: list[str] = []
         for line in text.splitlines()[:12]:
             line = line.strip()
@@ -760,17 +848,28 @@ def _run_with_live_feed(
     console.print(Panel(decided, title="run plan", border_style="cyan", box=SIMPLE))
     console.print(Rule(style="dim cyan"))
 
-    feed = ActivityFeed()
+    stop_event = threading.Event()
+    registry = default_registry(llm=llm, extraction_llm=extraction_llm)
+    feed = ActivityFeed(max_turns=max_turns, registry=registry)
     cfg = AgentConfig(
         max_turns=max_turns,
         verbose=False,
         event_subscribers=[feed.on_event],
+        stop_event=stop_event,
     )
 
     feed.set_thinking("contacting model…")
-    with Live(get_renderable=feed.render, console=console, refresh_per_second=4,
+
+    original_sigint = signal.getsignal(signal.SIGINT)
+
+    def _interrupt(sig, frame):  # noqa: ANN001
+        stop_event.set()
+        console.print("\n[yellow]⏸  stopping after current turn…[/yellow]")
+
+    with Live(get_renderable=feed.render, console=console, refresh_per_second=20,
               vertical_overflow="visible", transient=False) as live:
         feed.live = live
+        signal.signal(signal.SIGINT, _interrupt)
         try:
             result = run_agent(
                 goal=goal,
@@ -781,8 +880,10 @@ def _run_with_live_feed(
                 unique_key=unique_field or None,
                 config=cfg,
                 extra_memory={"wants_codebook": bool(want_codebook)},
+                registry=registry,
             )
         finally:
+            signal.signal(signal.SIGINT, original_sigint)
             feed.stop_spinner()
             live.update(feed.render())
 
@@ -997,7 +1098,7 @@ def ask_cmd(
     )
 
 
-# ── Claude-Code-style REPL ──────────────────────────────────────────────────
+# ── Interactive REPL ────────────────────────────────────────────────────────
 
 
 _CHAT_SYSTEM = """You are gemma-miner, an interactive agent that turns any website into a research-grade structured dataset.
@@ -1337,8 +1438,71 @@ def _push_workdir_to_hf(workdir: Path, repo_id: str, *, private: bool = True) ->
     )
 
 
+@dataclass
+class SlashCommand:
+    name: str           # e.g. "help"
+    description: str    # one-line shown in /help
+    run: Callable       # fn(repl: REPL, arg: str) -> None
+    aliases: list[str] = field(default_factory=list)
+    takes_arg: bool = False   # for /help display: shows "[<arg>]"
+
+
+_SLASH_REGISTRY: dict[str, SlashCommand] = {}
+
+# Mutable state the completer reads at keystroke time so it knows which
+# provider is active (and can offer matching model completions).
+_REPL_STATE: dict[str, str] = {
+    "provider": "openrouter",
+    "extraction_provider": "openrouter",
+}
+
+# Curated model suggestions shown when the user types `/model <Tab>` or
+# `/extract-model <Tab>`. Kept small and high-quality — not exhaustive.
+_PROVIDER_MODEL_SUGGESTIONS: dict[str, list[str]] = {
+    "openrouter": [
+        "google/gemini-3.1-flash-lite",
+        "google/gemini-3.1-flash",
+        "google/gemini-2.5-flash-preview",
+        "google/gemini-2.5-pro-preview",
+        "google/gemma-4-31b-it",
+        "google/gemma-3-27b-it",
+    ],
+    "together": [
+        "google/gemma-4-31b-it",
+        "google/gemma-3-27b-it",
+        "google/gemma-3-9b-it",
+    ],
+    "featherless": [
+        "google/gemma-4-31B-it",
+        "google/gemma-3-27B-it",
+        "google/gemma-3-9B-it",
+    ],
+    "ollama": [
+        "gemma4:31b",
+        "gemma4:27b",
+        "gemma3:27b",
+        "gemma3:9b",
+        "gemma3:4b",
+        "gemma3:2b",
+    ],
+    "openai-compatible": [],
+}
+
+
+def _known_models(provider: str) -> list[str]:
+    return _PROVIDER_MODEL_SUGGESTIONS.get(provider, [])
+
+
+def _register(*cmds: SlashCommand) -> None:
+    for cmd in cmds:
+        _SLASH_REGISTRY[cmd.name] = cmd
+        for alias in cmd.aliases:
+            _SLASH_REGISTRY[alias] = cmd
+
+
 # Central registry of slash commands — used by both /help and the auto-menu
 # that appears when the user types just `/`.
+# This is generated from _SLASH_REGISTRY after all commands are registered.
 SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/help",              "show this help"),
     ("/config",            "(re)run the provider + API-key setup wizard"),
@@ -1352,11 +1516,352 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/gemma-full-local",  "switch every phase to Ollama Gemma 31B (probes /api/tags)"),
     ("/resume <path>",     "resume a previous run (loads dataset + codebook + memory)"),
     ("/push <repo_id>",    "push the last run's dataset to Hugging Face"),
+    ("/status",            "show current REPL state (model, workdir, last run)"),
     ("/history",           "show conversation history"),
     ("/clear",             "clear the screen and history"),
     ("/trace",             "open the last run's trace.log path"),
     ("/quit, /exit",       "leave the REPL"),
 ]
+
+
+def _cmd_help(repl: "REPL", arg: str) -> None:  # noqa: ARG001
+    _show_help()
+
+
+def _cmd_status(repl: "REPL", arg: str) -> None:  # noqa: ARG001
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="cyan")
+    t.add_column()
+    t.add_row("agent", f"{repl.provider}/{repl.model}")
+    t.add_row("extractor", f"{repl.extraction_provider}/{repl.extraction_model}")
+    t.add_row("workdir", str(repl.base_workdir))
+    t.add_row("history", f"{len(repl.history)} turns")
+    if repl.last_workdir:
+        ds = repl.last_workdir / "dataset.jsonl"
+        n = 0
+        if ds.exists():
+            try:
+                n = sum(1 for l in ds.open("r", encoding="utf-8") if l.strip())
+            except Exception:  # noqa: BLE001
+                n = 0
+        t.add_row("last run", f"{repl.last_workdir.name}  ({n} rows)")
+    console.print(Panel(t, title="status", border_style="dim", box=SIMPLE))
+
+
+def _cmd_clean_config(repl: "REPL", arg: str) -> None:  # noqa: ARG001
+    cfg_path = _cfg.config_path()
+    if not cfg_path.exists():
+        console.print("[dim]no config to clean — already empty.[/dim]")
+        return
+    confirm = Prompt.ask(
+        f"[yellow]delete[/yellow] {cfg_path} "
+        "[yellow]and clear stored API keys?[/yellow]",
+        choices=["y", "n"], default="n",
+    )
+    if confirm == "y":
+        try:
+            cfg_path.unlink()
+            for env_name in _cfg.PROVIDER_API_KEY_ENV.values():
+                if env_name and env_name in os.environ:
+                    del os.environ[env_name]
+            console.print("[green]config cleared.[/green]")
+            rerun = Prompt.ask(
+                "  re-run the setup wizard now?",
+                choices=["y", "n"], default="y",
+            )
+            if rerun == "y":
+                run_configure_wizard(welcome=True)
+                _cfg.apply_env()
+                new_provider = _cfg.get_default_provider() or repl.provider
+                new_model = _cfg.get_recent_model(new_provider) or repl.model
+                try:
+                    repl.llm = make_llm(new_provider, model=new_model)
+                    repl.provider = new_provider
+                    repl.model = repl.llm.config.model
+                    console.print(
+                        f"[green]active provider → "
+                        f"{repl.provider}/{repl.model}[/green]"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    console.print(f"[red]could not switch active LLM: {e}[/red]")
+        except OSError as e:
+            console.print(f"[red]could not delete config: {e}[/red]")
+    else:
+        console.print("[dim]cancelled.[/dim]")
+
+
+def _cmd_config(repl: "REPL", arg: str) -> None:  # noqa: ARG001
+    run_configure_wizard(welcome=False)
+    _cfg.apply_env()
+    new_provider = _cfg.get_default_provider() or repl.provider
+    new_model = _cfg.get_recent_model(new_provider) or repl.model
+    try:
+        repl.llm = make_llm(new_provider, model=new_model)
+        repl.provider = new_provider
+        repl.model = repl.llm.config.model
+        console.print(
+            f"[green]active provider → {repl.provider}/{repl.model}[/green]"
+        )
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]could not switch active LLM: {e}[/red]")
+
+
+def _cmd_gemma_full_local(repl: "REPL", arg: str) -> None:  # noqa: ARG001
+    repl._switch_gemma_full_local()
+
+
+def _cmd_datasets(repl: "REPL", arg: str) -> None:  # noqa: ARG001
+    rows = _list_runs(repl.base_workdir)
+    if not rows:
+        console.print(f"[dim]no datasets in {repl.base_workdir}[/dim]")
+    else:
+        t = Table(title="datasets", header_style="bold cyan", box=ROUNDED)
+        t.add_column("name"); t.add_column("rows", justify="right")
+        t.add_column("codebook"); t.add_column("parquet"); t.add_column("path")
+        for r in rows:
+            t.add_row(r["name"], str(r["rows"]), r["codebook"], r["parquet"], r["path"])
+        console.print(t)
+
+
+def _cmd_workdir(repl: "REPL", arg: str) -> None:
+    if arg:
+        repl.base_workdir = Path(arg).expanduser().resolve()
+        console.print(f"[green]workdir → {repl.base_workdir}[/green]")
+    else:
+        console.print(f"[cyan]workdir:[/cyan] {repl.base_workdir}")
+
+
+def _cmd_provider(repl: "REPL", arg: str) -> None:
+    if not arg:
+        console.print(
+            f"[dim]current:[/dim] [cyan]{repl.provider}[/cyan]/"
+            f"[cyan]{repl.model}[/cyan]"
+        )
+        from gemma_miner import config as _c
+        labels = getattr(_c, "PROVIDER_LABELS", {})
+        providers = list_providers()
+        # Build display list: "openrouter  — Gemini / OpenRouter (fast, cheap)"
+        display = [f"{p}  —  {labels[p]}" if p in labels else p for p in providers]
+        chosen_display = _inline_select("agent provider", display, current=display[providers.index(repl.provider)] if repl.provider in providers else None)
+        if not chosen_display:
+            console.print("[dim]unchanged[/dim]")
+            return
+        # Map display string back to provider id
+        picked = providers[display.index(chosen_display)] if chosen_display in display else chosen_display.split()[0]
+        if picked == repl.provider:
+            console.print("[dim]unchanged[/dim]")
+            return
+        arg = picked
+    env_name = _cfg.PROVIDER_API_KEY_ENV.get(arg, "")
+    if env_name and not (os.environ.get(env_name) or _cfg.get_api_key(arg)):
+        console.print(
+            f"[yellow]No API key found for {arg} (env {env_name}).[/yellow]"
+        )
+        key = Prompt.ask(f"  paste your {arg} key", default="", password=True).strip()
+        if key:
+            _cfg.set_api_key(arg, key)
+            os.environ[env_name] = key
+    recent = _cfg.get_recent_model(arg)
+    try:
+        repl.llm = make_llm(arg, model=recent)
+        repl.provider = arg
+        repl.model = repl.llm.config.model
+        _cfg.set_default_provider(arg)
+        _cfg.set_recent_model(arg, repl.model)
+        _REPL_STATE["provider"] = arg
+        console.print(
+            f"[green]switched to {repl.provider}/{repl.model}[/green] "
+            f"[dim](saved as default in config)[/dim]"
+        )
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]could not switch: {e}[/red]")
+
+
+def _cmd_model(repl: "REPL", arg: str) -> None:
+    if not arg:
+        console.print(
+            f"[dim]current:[/dim] [cyan]{repl.provider}[/cyan]/[cyan]{repl.model}[/cyan]"
+        )
+        picked = _pick_model_interactive(repl.provider, repl.model)
+        if not picked or picked == repl.model:
+            console.print("[dim]unchanged[/dim]")
+            return
+        arg = picked
+    try:
+        repl.llm = make_llm(repl.provider, model=arg)
+        repl.model = arg
+        _cfg.set_recent_model(repl.provider, arg)
+        _REPL_STATE["provider"] = repl.provider
+        console.print(
+            f"[green]model → {arg}[/green] [dim](remembered for {repl.provider})[/dim]"
+        )
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]could not switch: {e}[/red]")
+
+
+def _cmd_extract_provider(repl: "REPL", arg: str) -> None:
+    if not arg:
+        console.print(
+            f"[dim]current extract:[/dim] "
+            f"[cyan]{repl.extraction_provider}[/cyan]/"
+            f"[cyan]{repl.extraction_model}[/cyan]"
+        )
+        from gemma_miner import config as _c
+        labels = getattr(_c, "PROVIDER_LABELS", {})
+        providers = list_providers()
+        display = [f"{p}  —  {labels[p]}" if p in labels else p for p in providers]
+        cur_disp = display[providers.index(repl.extraction_provider)] if repl.extraction_provider in providers else None
+        chosen_display = _inline_select("extraction provider", display, current=cur_disp)
+        if not chosen_display:
+            console.print("[dim]unchanged[/dim]")
+            return
+        picked = providers[display.index(chosen_display)] if chosen_display in display else chosen_display.split()[0]
+        if picked == repl.extraction_provider:
+            console.print("[dim]unchanged[/dim]")
+            return
+        arg = picked
+    env_name = _cfg.PROVIDER_API_KEY_ENV.get(arg, "")
+    if env_name and not (os.environ.get(env_name) or _cfg.get_api_key(arg)):
+        console.print(
+            f"[yellow]No API key found for {arg} (env {env_name}).[/yellow]"
+        )
+        key = Prompt.ask(f"  paste your {arg} key", default="", password=True).strip()
+        if key:
+            _cfg.set_api_key(arg, key)
+            os.environ[env_name] = key
+    recent = _cfg.get_recent_model(arg)
+    try:
+        test_llm = make_llm(arg, model=recent)
+        repl.extraction_provider = arg
+        repl.extraction_model = test_llm.config.model
+        _cfg.set_default_extract_provider(arg)
+        _cfg.set_recent_model(arg, repl.extraction_model)
+        _REPL_STATE["extraction_provider"] = arg
+        console.print(
+            f"[green]extraction → {repl.extraction_provider}/{repl.extraction_model}[/green] "
+            f"[dim](saved as default extract provider)[/dim]"
+        )
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]could not switch extraction: {e}[/red]")
+
+
+def _cmd_extract_model(repl: "REPL", arg: str) -> None:
+    if not arg:
+        console.print(
+            f"[dim]current extract:[/dim] "
+            f"[cyan]{repl.extraction_provider}[/cyan]/[cyan]{repl.extraction_model}[/cyan]"
+        )
+        picked = _pick_model_interactive(repl.extraction_provider, repl.extraction_model)
+        if not picked or picked == repl.extraction_model:
+            console.print("[dim]unchanged[/dim]")
+            return
+        arg = picked
+    try:
+        test_llm = make_llm(repl.extraction_provider, model=arg)
+        repl.extraction_model = test_llm.config.model
+        _cfg.set_recent_model(repl.extraction_provider, repl.extraction_model)
+        _REPL_STATE["extraction_provider"] = repl.extraction_provider
+        console.print(
+            f"[green]extraction model → {repl.extraction_model}[/green] "
+            f"[dim](remembered for {repl.extraction_provider})[/dim]"
+        )
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]could not switch: {e}[/red]")
+
+
+def _cmd_history(repl: "REPL", arg: str) -> None:  # noqa: ARG001
+    if not repl.history:
+        console.print("[dim]no history yet[/dim]")
+    else:
+        for m in repl.history[-10:]:
+            role = m["role"]
+            style = "bold green" if role == "user" else "bold cyan"
+            glyph = "you" if role == "user" else "gemma-miner"
+            console.print(Text.assemble((f"  {glyph}: ", style),
+                                         (_short(m["content"], 200), "white")))
+
+
+def _cmd_clear(repl: "REPL", arg: str) -> None:  # noqa: ARG001
+    console.clear()
+    repl.history.clear()
+    repl.show_banner()
+
+
+def _cmd_trace(repl: "REPL", arg: str) -> None:  # noqa: ARG001
+    if repl.last_workdir is None:
+        console.print("[dim]no run yet[/dim]")
+    else:
+        t = repl.last_workdir / "trace.log"
+        console.print(f"  [cyan]tail -F {t}[/cyan]")
+
+
+def _cmd_resume(repl: "REPL", arg: str) -> None:
+    if not arg:
+        rows = _list_runs(repl.base_workdir)
+        if not rows:
+            console.print("[dim]no runs to resume in this workspace[/dim]")
+        else:
+            console.print("[cyan]usage:[/cyan] /resume <run-name-or-path>")
+            for r in rows[-10:]:
+                console.print(f"  • {r['name']}  [dim]({r['rows']} rows · {r['path']})[/dim]")
+    else:
+        cand = Path(arg).expanduser()
+        if not cand.is_absolute():
+            under_base = repl.base_workdir / arg
+            if under_base.exists():
+                cand = under_base
+        if not (cand / "dataset.jsonl").exists():
+            console.print(f"[red]no dataset.jsonl found under {cand}[/red]")
+        else:
+            repl.last_workdir = cand.resolve()
+            n_rows = sum(1 for _ in (cand / "dataset.jsonl").open("r", encoding="utf-8"))
+            has_cb = (cand / "codebook.json").exists()
+            has_silver = (cand / "extracted.jsonl").exists()
+            console.print(Panel(
+                f"[green]resumed[/green] {repl.last_workdir}\n"
+                f"  bronze rows: {n_rows}\n"
+                f"  codebook:    {'yes' if has_cb else 'no'}\n"
+                f"  silver:      {'yes' if has_silver else 'no'}\n"
+                "[dim]tip: ask things like \"push this to huggingface as me/cnil-sanctions\""
+                " or \"add a fine_bucket variable to the codebook and re-extract\".[/dim]",
+                border_style="green", box=ROUNDED,
+            ))
+
+
+def _cmd_push(repl: "REPL", arg: str) -> None:
+    if not arg:
+        console.print("[cyan]usage:[/cyan] /push <repo_id>   (e.g. /push you/cnil-sanctions)")
+    elif repl.last_workdir is None:
+        console.print("[red]no run to push — start one, or `/resume <path>` first[/red]")
+    else:
+        _push_workdir_to_hf(repl.last_workdir, arg)
+
+
+def _cmd_quit(repl: "REPL", arg: str) -> None:  # noqa: ARG001
+    raise EOFError()
+
+
+# ── Register all slash commands ─────────────────────────────────────────────
+
+_register(
+    SlashCommand("help", "show this help", _cmd_help, aliases=["?"]),
+    SlashCommand("status", "show current REPL state (model, workdir, last run)", _cmd_status),
+    SlashCommand("clean-config", "delete the stored config and re-run the wizard", _cmd_clean_config),
+    SlashCommand("config", "(re)run the provider + API-key setup wizard", _cmd_config),
+    SlashCommand("gemma-full-local", "switch every phase to Ollama Gemma 31B (probes /api/tags)", _cmd_gemma_full_local),
+    SlashCommand("datasets", "list datasets produced in this workspace", _cmd_datasets),
+    SlashCommand("workdir", "show or change the base workdir (./runs)", _cmd_workdir, takes_arg=True),
+    SlashCommand("provider", "pick the AGENT provider (no arg = interactive menu, or pass a name)", _cmd_provider, takes_arg=True),
+    SlashCommand("model", "show or switch the AGENT model (remembered across runs)", _cmd_model, takes_arg=True),
+    SlashCommand("extract-provider", "pick the EXTRACTION provider (the per-row codebook model)", _cmd_extract_provider, aliases=["extraction-provider"], takes_arg=True),
+    SlashCommand("extract-model", "show or switch the EXTRACTION model", _cmd_extract_model, aliases=["extraction-model"], takes_arg=True),
+    SlashCommand("history", "show conversation history", _cmd_history),
+    SlashCommand("clear", "clear the screen and history", _cmd_clear),
+    SlashCommand("trace", "open the last run's trace.log path", _cmd_trace),
+    SlashCommand("resume", "resume a previous run (loads dataset + codebook + memory)", _cmd_resume, takes_arg=True),
+    SlashCommand("push", "push the last run's dataset to Hugging Face", _cmd_push, takes_arg=True),
+    SlashCommand("quit", "leave the REPL", _cmd_quit, aliases=["exit", "q"]),
+)
 
 
 def _show_help() -> None:
@@ -1387,6 +1892,181 @@ def _show_slash_menu(filter_prefix: str = "") -> None:
     console.print(Panel(t, title=title, title_align="left", border_style="dim"))
 
 
+# ── inline arrow-key picker ─────────────────────────────────────────────────
+
+
+def _ensure_space_below(n: int) -> None:
+    """Guarantee n blank rows below the current cursor without losing position.
+
+    Writes n newlines (scrolling the terminal buffer if near the bottom) then
+    moves the cursor back up n rows with a VT escape so the caller's position
+    is unchanged. This gives an inline prompt_toolkit Application room to
+    render without clipping at the terminal edge.
+    """
+    import sys
+    sys.stdout.write("\n" * n)
+    sys.stdout.write(f"\x1b[{n}A")  # cursor up n rows
+    sys.stdout.flush()
+
+
+def _inline_select(title: str, items: list[str], current: str | None = None) -> str | None:
+    """Arrow-key navigable picker rendered inline in the terminal.
+
+    Mirrors the Claude Code Select component UX:
+      - ❯  marks the focused row; (active) marks the current value
+      - ↑ / ↓ navigate, 1-9 jump directly
+      - Enter confirms, Escape / Ctrl-C cancels
+      - Never taller than terminal_rows - 2 (always leaves a bottom gap)
+
+    Falls back to a numbered Rich prompt when prompt_toolkit is unavailable.
+    """
+    if not items:
+        return None
+
+    try:
+        import shutil as _shutil
+        import sys as _sys
+        from prompt_toolkit import Application
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import Layout
+        from prompt_toolkit.layout.containers import HSplit, Window
+        from prompt_toolkit.layout.controls import FormattedTextControl
+        from prompt_toolkit.styles import Style as PTStyle
+    except ImportError:
+        return _fallback_numbered_pick(title, items, current)
+
+    # Never taller than terminal rows - 2 (same pattern as Claude Code: rows - 2).
+    # The title line + 1 blank gap above + 2 blank gap below = 4 chrome rows.
+    term_rows = _shutil.get_terminal_size().lines
+    MAX_VISIBLE = max(3, min(10, len(items), term_rows - 6))
+
+    focus_idx = [items.index(current) if current in items else 0]
+    result: list[str | None] = [None]
+
+    def _content() -> list[tuple[str, str]]:
+        fi = focus_idx[0]
+        half = MAX_VISIBLE // 2
+        start = max(0, min(fi - half, len(items) - MAX_VISIBLE))
+        end = min(len(items), start + MAX_VISIBLE)
+
+        ft: list[tuple[str, str]] = []
+        if start > 0:
+            ft.append(("class:hint", f"  ↑ {start} more\n"))
+        for i in range(start, end):
+            item = items[i]
+            is_focused = (i == fi)
+            is_active = (item == current)
+            num = str(i + 1) if i < 9 else " "
+            active_tag = "  (active)" if is_active else ""
+            if is_focused:
+                ft.append(("class:focused", f" ❯ {num}  {item}{active_tag}\n"))
+            elif is_active:
+                ft.append(("class:active", f"   {num}  {item}{active_tag}\n"))
+            else:
+                ft.append(("class:item", f"   {num}  {item}\n"))
+        remaining = len(items) - end
+        if remaining > 0:
+            ft.append(("class:hint", f"  ↓ {remaining} more\n"))
+        ft.append(("class:footer", "\n  ↑↓ move  ·  1-9 jump  ·  Enter select  ·  Esc cancel\n"))
+        return ft
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _up(event): focus_idx[0] = (focus_idx[0] - 1) % len(items)
+
+    @kb.add("down")
+    def _down(event): focus_idx[0] = (focus_idx[0] + 1) % len(items)
+
+    @kb.add("enter")
+    def _enter(event):
+        result[0] = items[focus_idx[0]]
+        event.app.exit()
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _cancel(event): event.app.exit()
+
+    for _digit in "123456789":
+        @kb.add(_digit)
+        def _jump(event, d=_digit):
+            idx = int(d) - 1
+            if idx < len(items):
+                focus_idx[0] = idx
+
+    # 2 rows for the possible scroll-hint lines + 1 blank + footer line = 4 chrome
+    height = MAX_VISIBLE + 4
+    layout = Layout(HSplit([Window(FormattedTextControl(_content), height=height)]))
+    pt_style = PTStyle.from_dict({
+        "focused": "bold ansicyan",
+        "active":  "ansiyellow",
+        "item":    "",
+        "hint":    "ansiblue dim",
+        "footer":  "dim",
+    })
+
+    # Print title then pre-scroll the terminal so the app always has room.
+    # height + 2 = app content + 2-row bottom gap (mirrors Claude Code's rows-2 rule).
+    console.print(f"\n[bold]{title}[/bold]")
+    _ensure_space_below(height + 2)
+
+    Application(
+        layout=layout,
+        key_bindings=kb,
+        style=pt_style,
+        full_screen=False,
+        mouse_support=False,
+    ).run()
+    return result[0]
+
+
+def _fallback_numbered_pick(title: str, items: list[str], current: str | None = None) -> str | None:
+    """Numbered-list fallback when prompt_toolkit Application is unavailable."""
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    for i, item in enumerate(items, 1):
+        mark = "  (active)" if item == current else ""
+        t.add_row(f"[cyan]{i}[/cyan]", f"{item}{mark}")
+    console.print(Panel(t, title=title, border_style="dim", box=SIMPLE))
+    default_idx = (items.index(current) + 1) if current in items else 1
+    raw = Prompt.ask("  pick (number or name)", default=str(default_idx)).strip()
+    if raw.isdigit():
+        idx = int(raw) - 1
+        if 0 <= idx < len(items):
+            return items[idx]
+    return raw if raw in items else None
+
+
+def _pick_model_interactive(provider: str, current_model: str | None) -> str | None:
+    """Show an inline model picker for the given provider.
+
+    For Ollama: queries /api/tags live. For other providers: uses curated list.
+    Returns the chosen model id, or None (user cancelled / no models found).
+    """
+    if provider == "ollama":
+        tags = _ollama_tags()
+        if tags:
+            def _sort_key(m: dict) -> tuple[int, str]:
+                name = str(m.get("name") or m.get("model") or "").lower()
+                return (0 if "gemma" in name else 1, name)
+            ordered = sorted(tags, key=_sort_key)
+            model_list = [str(m.get("name") or m.get("model") or "?") for m in ordered]
+        else:
+            console.print("[yellow]Ollama not reachable — type model name manually.[/yellow]")
+            model_list = []
+    else:
+        model_list = _known_models(provider)
+
+    if model_list:
+        return _inline_select(f"model  ·  {provider}", model_list, current=current_model)
+
+    # No list available — plain text entry
+    picked = Prompt.ask(
+        f"  model for [cyan]{provider}[/cyan]",
+        default=current_model or "",
+    ).strip()
+    return picked or None
+
+
 # ── multi-line prompt helper ────────────────────────────────────────────────
 
 
@@ -1395,22 +2075,16 @@ _PT_SESSION = None  # type: ignore[var-annotated]
 
 
 def _build_pt_session():
-    """Build a prompt_toolkit PromptSession that pops up a live slash-command
-    menu the instant the user types `/`. Falls back to None when
-    prompt_toolkit isn't available (then we use plain rich Prompt).
+    """Build a prompt_toolkit PromptSession with:
 
-    Implementation notes (why each option is here):
-      - complete_while_typing=True   → fires the completer on every keystroke,
-        so the menu refreshes live as the user narrows the prefix.
-      - reserve_space_for_menu=8     → reserves 8 visible rows BELOW the
-        prompt so the dropdown actually appears; without this, some
-        terminals render the menu off-screen.
-      - complete_style=MULTI_COLUMN  → a vertical, IDE-style list with the
-        meta description on the right (closest to Claude Code's UX).
-      - Custom `/` keybinding        → if `complete_while_typing` somehow
-        misses the very first `/` (rare on slow terminals), we explicitly
-        start_completion(). insert_text=False because the default `/`
-        handler still runs after our handler returns.
+    - Slash-command completions on `/` (vertical READLINE_LIKE list with
+      descriptions on the right — easy arrow-key navigation).
+    - Sub-argument completions for `/model`, `/extract-model`, `/provider`,
+      `/extract-provider` — after the space, the menu switches to offering
+      known models or provider names, filtered as you type.
+    - A forced completion trigger on `/` so the menu always pops up.
+
+    Falls back to None when prompt_toolkit isn't installed.
     """
     try:
         from prompt_toolkit import PromptSession
@@ -1423,20 +2097,64 @@ def _build_pt_session():
     except Exception:  # noqa: BLE001
         return None
 
+    # Commands that accept a subcommand argument and what completions to emit.
+    # Each value is a callable(prefix) -> list[(value, meta_desc)].
+    def _provider_completions(prefix: str) -> list[tuple[str, str]]:
+        from gemma_miner import config as _c
+        labels = _c.PROVIDER_LABELS if hasattr(_c, "PROVIDER_LABELS") else {}
+        return [
+            (p, labels.get(p, p))
+            for p in list_providers()
+            if p.startswith(prefix)
+        ]
+
+    def _model_completions(prefix: str, provider_key: str) -> list[tuple[str, str]]:
+        provider = _REPL_STATE.get(provider_key, "openrouter")
+        models = _known_models(provider)
+        return [(m, provider) for m in models if prefix in m]
+
+    _SUBARG_COMPLETIONS: dict[str, Any] = {
+        "/model":            lambda p: _model_completions(p, "provider"),
+        "/extract-model":    lambda p: _model_completions(p, "extraction_provider"),
+        "/extraction-model": lambda p: _model_completions(p, "extraction_provider"),
+        "/provider":         lambda p: _provider_completions(p),
+        "/extract-provider": lambda p: _provider_completions(p),
+        "/extraction-provider": lambda p: _provider_completions(p),
+    }
+
     class _SlashCompleter(Completer):
-        """Emit completions only when the input starts with `/`. Stays out
-        of the way during normal free-text prompts."""
+        """Emit completions only when the input starts with `/`.
+
+        Two modes:
+          1. No space yet  → complete command names (with description).
+          2. After a space → complete the subcommand argument (model or provider).
+        """
 
         def get_completions(self, document, complete_event):
             text = document.text_before_cursor
             if not text.startswith("/"):
                 return
+
+            # Check if we're completing a subcommand argument (space after cmd).
+            if " " in text:
+                cmd_part, _, arg_prefix = text.partition(" ")
+                fn = _SUBARG_COMPLETIONS.get(cmd_part.lower())
+                if fn is None:
+                    return
+                for value, meta in fn(arg_prefix.lower()):
+                    yield Completion(
+                        value,
+                        start_position=-len(arg_prefix),
+                        display=value,
+                        display_meta=meta,
+                    )
+                return
+
+            # Command-name completion.
             prefix = text.lower()
             for full, desc in SLASH_COMMANDS:
-                cmd = full.split()[0]  # strip args from "/push <repo_id>"
+                cmd = full.split()[0]
                 if cmd.startswith(prefix):
-                    # start_position replaces the whole `/...` we typed so
-                    # selecting from the menu replaces in-place.
                     yield Completion(
                         cmd,
                         start_position=-len(text),
@@ -1458,30 +2176,54 @@ def _build_pt_session():
 
     @kb.add("/")
     def _force_show_menu(event):
-        """Insert `/` then immediately ask prompt_toolkit to start a
-        completion cycle, so the dropdown is guaranteed to appear even on
-        terminals that don't auto-render `complete_while_typing` reliably
-        for the very first character."""
+        """Insert `/` and immediately trigger completion so the menu appears."""
         buf = event.current_buffer
         buf.insert_text("/")
         buf.start_completion(select_first=False)
 
+    @kb.add(" ")
+    def _space_trigger_completion(event):
+        """After typing a space following a known sub-arg command, trigger
+        completion so the model/provider list pops up immediately."""
+        buf = event.current_buffer
+        buf.insert_text(" ")
+        text = buf.text
+        if any(text.lower().startswith(cmd + " ") for cmd in _SUBARG_COMPLETIONS):
+            buf.start_completion(select_first=False)
+
+    @kb.add("backspace")
+    def _backspace_retrigger(event):
+        """Delete one char, then re-trigger completions if still in a slash context.
+
+        prompt_toolkit's complete_while_typing fires on insert but not always on
+        delete. This ensures the menu stays live and filters correctly as the
+        user backspaces through a command or model name.
+        """
+        buf = event.current_buffer
+        buf.delete_before_cursor()
+        if buf.text.startswith("/"):
+            buf.start_completion(select_first=False)
+
     return PromptSession(
         completer=_SlashCompleter(),
         complete_while_typing=True,
-        complete_style=CompleteStyle.MULTI_COLUMN,
+        # COLUMN = single-column popup: appears while typing, arrow-navigable.
+        # (READLINE_LIKE only fires on Tab; MULTI_COLUMN is hard to read)
+        complete_style=CompleteStyle.COLUMN,
+        # 8 = pre-scroll the terminal to reserve 8 rows below the cursor so the
+        # completion popup always has room to render below. The Float auto-flip
+        # logic in containers.py can't reliably flip above in single-line mode
+        # (write_position.height==1 makes the height calculation collapse to 0).
+        # Reserving space is the pragmatic fix — same approach as most TUI CLIs.
         reserve_space_for_menu=8,
         history=InMemoryHistory(),
         multiline=False,
         style=style,
         key_bindings=kb,
-        # Mouse capture would hijack the trackpad — you'd lose native scroll
-        # and click-to-select-text in the terminal. Keep it off; the slash
-        # menu works fine with keyboard nav (arrows + Enter).
         mouse_support=False,
         bottom_toolbar=lambda: HTML(
-            ' <b>/</b> commands  ·  <b>"""</b> heredoc  ·  '
-            '<b>\\</b> line-continue  ·  <b>↑↓</b> history'
+            ' <b>/</b> commands  ·  <b>/model</b> + space = pick model  ·  '
+            '<b>"""</b> heredoc  ·  <b>↑↓</b> history'
         ),
     )
 
@@ -1534,6 +2276,31 @@ def _read_multiline_prompt() -> str | None:
     return line.strip()
 
 
+def _make_repl_with_key_prompt(provider: str, model: str | None) -> "REPL":
+    """Create a REPL, prompting for a missing API key if the provider requires one."""
+    for _attempt in range(2):
+        try:
+            return REPL(provider=provider, model=model)
+        except RuntimeError as e:
+            msg = str(e)
+            if "requires an API key" not in msg:
+                raise
+            from gemma_miner.providers import PRESETS
+            preset = PRESETS.get(provider)
+            env_name = preset.api_key_env if preset else f"{provider.upper()}_API_KEY"
+            console.print(
+                f"\n[bold yellow]⚠[/bold yellow]  [bold]{provider}[/bold] needs an API key "
+                f"(not found in config or [dim]{env_name}[/dim])."
+            )
+            key = Prompt.ask("  paste key", default="", password=True).strip()
+            if not key:
+                console.print("[dim]no key entered — aborting[/dim]")
+                raise typer.Exit(1) from e
+            _cfg.set_api_key(provider, key)
+            _cfg.apply_env()
+    raise RuntimeError(f"Could not initialise provider {provider!r}")  # unreachable
+
+
 class REPL:
     """Persistent conversational shell — chats for small-talk, runs the
     full agent pipeline for scrape tasks. Keeps conversation history so the
@@ -1549,6 +2316,9 @@ class REPL:
         self.base_workdir = Path("./runs")
         self.history: list[dict] = []
         self.last_workdir: Path | None = None
+        # Seed the global state dict so the completion menu can offer models.
+        _REPL_STATE["provider"] = provider
+        _REPL_STATE["extraction_provider"] = DEFAULT_EXTRACTION_PROVIDER
 
     def show_banner(self) -> None:
         extract_line = ""
@@ -1586,261 +2356,19 @@ class REPL:
         cmd = parts[0].lower() if parts else ""
         arg = parts[1].strip() if len(parts) > 1 else ""
 
-        # Bare `/` (or `/<partial>` with no exact match) → show the menu.
-        # The user can then read the list and type the full command.
+        # Bare `/` → show the menu.
         if not cmd:
             _show_slash_menu()
             return True
 
-        if cmd in ("help", "?"):
-            _show_help()
-        elif cmd == "clean-config":
-            cfg_path = _cfg.config_path()
-            if not cfg_path.exists():
-                console.print("[dim]no config to clean — already empty.[/dim]")
-            else:
-                confirm = Prompt.ask(
-                    f"[yellow]delete[/yellow] {cfg_path} "
-                    "[yellow]and clear stored API keys?[/yellow]",
-                    choices=["y", "n"], default="n",
-                )
-                if confirm == "y":
-                    try:
-                        cfg_path.unlink()
-                        # Wipe the env vars we previously applied from config
-                        # so the next run starts truly clean.
-                        for env_name in _cfg.PROVIDER_API_KEY_ENV.values():
-                            if env_name and env_name in os.environ:
-                                del os.environ[env_name]
-                        console.print("[green]config cleared.[/green]")
-                        rerun = Prompt.ask(
-                            "  re-run the setup wizard now?",
-                            choices=["y", "n"], default="y",
-                        )
-                        if rerun == "y":
-                            run_configure_wizard(welcome=True)
-                            _cfg.apply_env()
-                            new_provider = _cfg.get_default_provider() or self.provider
-                            new_model = _cfg.get_recent_model(new_provider) or self.model
-                            try:
-                                self.llm = make_llm(new_provider, model=new_model)
-                                self.provider = new_provider
-                                self.model = self.llm.config.model
-                                console.print(
-                                    f"[green]active provider → "
-                                    f"{self.provider}/{self.model}[/green]"
-                                )
-                            except Exception as e:  # noqa: BLE001
-                                console.print(f"[red]could not switch active LLM: {e}[/red]")
-                    except OSError as e:
-                        console.print(f"[red]could not delete config: {e}[/red]")
-                else:
-                    console.print("[dim]cancelled.[/dim]")
-        elif cmd == "config":
-            run_configure_wizard(welcome=False)
-            # Re-apply env and re-init the LLM with the new defaults.
-            _cfg.apply_env()
-            new_provider = _cfg.get_default_provider() or self.provider
-            new_model = _cfg.get_recent_model(new_provider) or self.model
-            try:
-                self.llm = make_llm(new_provider, model=new_model)
-                self.provider = new_provider
-                self.model = self.llm.config.model
-                console.print(
-                    f"[green]active provider → {self.provider}/{self.model}[/green]"
-                )
-            except Exception as e:  # noqa: BLE001
-                console.print(f"[red]could not switch active LLM: {e}[/red]")
-        elif cmd == "gemma-full-local":
-            self._switch_gemma_full_local()
-        elif cmd == "datasets":
-            rows = _list_runs(self.base_workdir)
-            if not rows:
-                console.print(f"[dim]no datasets in {self.base_workdir}[/dim]")
-            else:
-                t = Table(title="datasets", header_style="bold cyan", box=ROUNDED)
-                t.add_column("name"); t.add_column("rows", justify="right")
-                t.add_column("codebook"); t.add_column("parquet"); t.add_column("path")
-                for r in rows:
-                    t.add_row(r["name"], str(r["rows"]), r["codebook"], r["parquet"], r["path"])
-                console.print(t)
-        elif cmd == "workdir":
-            if arg:
-                self.base_workdir = Path(arg).expanduser().resolve()
-                console.print(f"[green]workdir → {self.base_workdir}[/green]")
-            else:
-                console.print(f"[cyan]workdir:[/cyan] {self.base_workdir}")
-        elif cmd == "provider":
-            # No arg → interactive picker (numbered menu). Argument form
-            # `/provider together` still works as a quick switch.
-            if not arg:
-                console.print(
-                    f"[dim]current:[/dim] [cyan]{self.provider}[/cyan]/"
-                    f"[cyan]{self.model}[/cyan]"
-                )
-                picked = _wizard_pick_provider(self.provider)
-                if picked == self.provider:
-                    console.print("[dim]unchanged[/dim]")
-                    return True
-                arg = picked
-            # If the provider needs an API key and we don't have one,
-            # prompt now and save to config.
-            env_name = _cfg.PROVIDER_API_KEY_ENV.get(arg, "")
-            if env_name and not (os.environ.get(env_name) or _cfg.get_api_key(arg)):
-                console.print(
-                    f"[yellow]No API key found for {arg} (env {env_name}).[/yellow]"
-                )
-                key = Prompt.ask(f"  paste your {arg} key", default="", password=True).strip()
-                if key:
-                    _cfg.set_api_key(arg, key)
-                    os.environ[env_name] = key
-            # Pick a recent model for this provider if we have one.
-            recent = _cfg.get_recent_model(arg)
-            try:
-                self.llm = make_llm(arg, model=recent)
-                self.provider = arg
-                self.model = self.llm.config.model
-                _cfg.set_default_provider(arg)
-                _cfg.set_recent_model(arg, self.model)
-                console.print(
-                    f"[green]switched to {self.provider}/{self.model}[/green] "
-                    f"[dim](saved as default in config)[/dim]"
-                )
-            except Exception as e:  # noqa: BLE001
-                console.print(f"[red]could not switch: {e}[/red]")
-        elif cmd == "model":
-            if arg:
-                try:
-                    self.llm = make_llm(self.provider, model=arg)
-                    self.model = arg
-                    _cfg.set_recent_model(self.provider, arg)
-                    console.print(
-                        f"[green]model → {arg}[/green] [dim](remembered for {self.provider})[/dim]"
-                    )
-                except Exception as e:  # noqa: BLE001
-                    console.print(f"[red]could not switch: {e}[/red]")
-            else:
-                console.print(f"[cyan]model:[/cyan] {self.model}")
-        elif cmd in ("extract-provider", "extraction-provider"):
-            # No arg → interactive picker; with arg → quick switch.
-            if not arg:
-                console.print(
-                    f"[dim]current extract:[/dim] "
-                    f"[cyan]{self.extraction_provider}[/cyan]/"
-                    f"[cyan]{self.extraction_model}[/cyan]"
-                )
-                picked = _wizard_pick_provider(self.extraction_provider)
-                if picked == self.extraction_provider:
-                    console.print("[dim]unchanged[/dim]")
-                    return True
-                arg = picked
-            # Prompt for API key if missing.
-            env_name = _cfg.PROVIDER_API_KEY_ENV.get(arg, "")
-            if env_name and not (os.environ.get(env_name) or _cfg.get_api_key(arg)):
-                console.print(
-                    f"[yellow]No API key found for {arg} (env {env_name}).[/yellow]"
-                )
-                key = Prompt.ask(f"  paste your {arg} key", default="", password=True).strip()
-                if key:
-                    _cfg.set_api_key(arg, key)
-                    os.environ[env_name] = key
-            recent = _cfg.get_recent_model(arg)
-            try:
-                # Validate the model is reachable on this provider before
-                # committing the switch — otherwise extraction blows up later.
-                test_llm = make_llm(arg, model=recent)
-                self.extraction_provider = arg
-                self.extraction_model = test_llm.config.model
-                _cfg.set_default_extract_provider(arg)
-                _cfg.set_recent_model(arg, self.extraction_model)
-                console.print(
-                    f"[green]extraction → {self.extraction_provider}/{self.extraction_model}[/green] "
-                    f"[dim](saved as default extract provider)[/dim]"
-                )
-            except Exception as e:  # noqa: BLE001
-                console.print(f"[red]could not switch extraction: {e}[/red]")
-        elif cmd in ("extract-model", "extraction-model"):
-            if arg:
-                try:
-                    test_llm = make_llm(self.extraction_provider, model=arg)
-                    self.extraction_model = test_llm.config.model
-                    _cfg.set_recent_model(self.extraction_provider, self.extraction_model)
-                    console.print(
-                        f"[green]extraction model → {self.extraction_model}[/green] "
-                        f"[dim](remembered for {self.extraction_provider})[/dim]"
-                    )
-                except Exception as e:  # noqa: BLE001
-                    console.print(f"[red]could not switch: {e}[/red]")
-            else:
-                console.print(
-                    f"[cyan]extraction:[/cyan] "
-                    f"{self.extraction_provider}/{self.extraction_model}"
-                )
-        elif cmd == "history":
-            if not self.history:
-                console.print("[dim]no history yet[/dim]")
-            else:
-                for m in self.history[-10:]:
-                    role = m["role"]
-                    style = "bold green" if role == "user" else "bold cyan"
-                    glyph = "you" if role == "user" else "gemma-miner"
-                    console.print(Text.assemble((f"  {glyph}: ", style),
-                                                 (_short(m["content"], 200), "white")))
-        elif cmd == "clear":
-            console.clear()
-            self.history.clear()
-            self.show_banner()
-        elif cmd == "trace":
-            if self.last_workdir is None:
-                console.print("[dim]no run yet[/dim]")
-            else:
-                t = self.last_workdir / "trace.log"
-                console.print(f"  [cyan]tail -F {t}[/cyan]")
-        elif cmd == "resume":
-            if not arg:
-                rows = _list_runs(self.base_workdir)
-                if not rows:
-                    console.print("[dim]no runs to resume in this workspace[/dim]")
-                else:
-                    console.print("[cyan]usage:[/cyan] /resume <run-name-or-path>")
-                    for r in rows[-10:]:
-                        console.print(f"  • {r['name']}  [dim]({r['rows']} rows · {r['path']})[/dim]")
-            else:
-                cand = Path(arg).expanduser()
-                if not cand.is_absolute():
-                    # Try treating it as a run-name under base_workdir first.
-                    under_base = self.base_workdir / arg
-                    if under_base.exists():
-                        cand = under_base
-                if not (cand / "dataset.jsonl").exists():
-                    console.print(f"[red]no dataset.jsonl found under {cand}[/red]")
-                else:
-                    self.last_workdir = cand.resolve()
-                    n_rows = sum(1 for _ in (cand / "dataset.jsonl").open("r", encoding="utf-8"))
-                    has_cb = (cand / "codebook.json").exists()
-                    has_silver = (cand / "extracted.jsonl").exists()
-                    console.print(Panel(
-                        f"[green]resumed[/green] {self.last_workdir}\n"
-                        f"  bronze rows: {n_rows}\n"
-                        f"  codebook:    {'yes' if has_cb else 'no'}\n"
-                        f"  silver:      {'yes' if has_silver else 'no'}\n"
-                        "[dim]tip: ask things like \"push this to huggingface as me/cnil-sanctions\""
-                        " or \"add a fine_bucket variable to the codebook and re-extract\".[/dim]",
-                        border_style="green", box=ROUNDED,
-                    ))
-        elif cmd == "push":
-            if not arg:
-                console.print("[cyan]usage:[/cyan] /push <repo_id>   (e.g. /push you/cnil-sanctions)")
-            elif self.last_workdir is None:
-                console.print("[red]no run to push — start one, or `/resume <path>` first[/red]")
-            else:
-                _push_workdir_to_hf(self.last_workdir, arg)
-        elif cmd in ("quit", "exit", "q"):
-            raise EOFError()
-        else:
-            # Unknown command — show matching options if there's a prefix.
+        # Look up in registry (name first, then aliases).
+        command = _SLASH_REGISTRY.get(cmd)
+        if command is None:
             console.print(f"[red]unknown command: /{cmd}[/red]")
             _show_slash_menu(filter_prefix=f"/{cmd}")
+            return True
+
+        command.run(self, arg)
         return True
 
     # ── /gemma-full-local ──────────────────────────────────────────────────
@@ -1898,8 +2426,10 @@ class REPL:
         # The model decides chat-vs-task AND produces the reply in ONE call.
         # When a previous run exists, its dataset sample is injected so the
         # model can answer follow-ups about it without triggering a re-scrape.
-        spinner = Spinner("dots", text=Text("thinking…", style="cyan"))
-        with Live(spinner, console=console, refresh_per_second=8, transient=True):
+        with Live(
+            _shimmer_spinner_renderable(), console=console,
+            refresh_per_second=20, transient=True,
+        ):
             mode, reply = _classify_and_reply(
                 self.llm, self.history, message,
                 last_workdir=self.last_workdir,
@@ -1942,8 +2472,10 @@ class REPL:
         self.history.append({"role": "assistant", "content": summary})
 
     def _render_chat_reply(self, message: str) -> None:
-        spinner = Spinner("dots", text=Text("thinking…", style="cyan"))
-        with Live(spinner, console=console, refresh_per_second=8, transient=True):
+        with Live(
+            _shimmer_spinner_renderable(), console=console,
+            refresh_per_second=20, transient=True,
+        ):
             try:
                 reply = _chat_completion(self.llm, self.history, message)
             except Exception as e:  # noqa: BLE001
@@ -1966,7 +2498,7 @@ def chat_cmd(
     provider: str = typer.Option(None, "--provider"),
     model: str = typer.Option(None, "--model", "-m"),
 ) -> None:
-    """Interactive Claude-Code-style shell. Type freely, /help for commands."""
+    """Interactive shell. Type freely, /help for commands."""
     # Autoload .env so users don't need to remember `export OPENROUTER_API_KEY=…`
     # before launching the REPL. _dotenv is a tiny shim that respects existing env.
     try:
@@ -1994,7 +2526,7 @@ def chat_cmd(
     # If no explicit model and the config has a recent_model for this provider, use it.
     if model is None:
         model = _cfg.get_recent_model(provider)
-    repl = REPL(provider=provider, model=model)
+    repl = _make_repl_with_key_prompt(provider, model)
     repl.show_banner()
     while True:
         line = _read_multiline_prompt()
