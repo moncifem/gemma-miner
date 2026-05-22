@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +50,13 @@ class AgentConfig:
     # Live event subscribers — every Tracer event also flows to these
     # callables. The CLI plugs its ActivityFeed in here.
     event_subscribers: list = field(default_factory=list)
+    # Set to interrupt the agent gracefully between turns (Ctrl+C from CLI).
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    # Extra system-prompt modules appended AFTER the static SYSTEM_PROMPT list.
+    # Use this to inject domain-specific context at run time without modifying
+    # the static prompt -- analogous to the appendSystemPrompt field in the
+    # tool use context of some agent frameworks.
+    extra_system_modules: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -154,6 +162,10 @@ class Agent:
         turn = start_turn
         while turn < self.config.max_turns and not state.finished:
             turn += 1
+            if self.config.stop_event.is_set():
+                tracer.note("interrupted", "stop_event set between turns")
+                state.finish_reason = "interrupted by user"
+                break
             min_rows = None
             for c in state.contracts.list():
                 if isinstance(c, MinRowsContract):
@@ -164,7 +176,7 @@ class Agent:
 
             brief = render_state_brief(state, self.registry)
             messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": "\n\n".join(SYSTEM_PROMPT + self.config.extra_system_modules)},
                 {"role": "user", "content": brief},
             ]
             if self.config.verbose:
@@ -370,6 +382,7 @@ def run_agent(
     unique_key: str | None = None,
     config: AgentConfig | None = None,
     extra_memory: dict[str, Any] | None = None,
+    registry: "ToolRegistry | None" = None,
 ) -> RunResult:
     """One-shot helper. Sets up state, runs the agent, returns the result."""
     workdir = Path(workdir).resolve()
@@ -390,5 +403,5 @@ def run_agent(
     )
 
     llm = llm or LLMClient()
-    agent = Agent(llm=llm, extraction_llm=extraction_llm, config=config)
+    agent = Agent(llm=llm, extraction_llm=extraction_llm, config=config, registry=registry)
     return agent.run(state)
