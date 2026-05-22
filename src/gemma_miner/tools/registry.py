@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 # through verbatim — resolving $file on a path-taking tool would corrupt it.
 _REF_RESOLVE_ALLOWED = {
     "dataset_append",
+    "dataset_patch",
     "extract_structured",
     "write_file",
     "codebook_propose",
@@ -65,9 +66,32 @@ class ToolRegistry:
                     error=True,
                 )
         try:
-            return tool.run(args, state)
+            result = tool.run(args, state)
         except Exception as e:  # noqa: BLE001
             return ToolResult(output=f"ERROR: {type(e).__name__}: {e}", error=True)
+
+        # Truncate output that exceeds the tool's declared budget so the
+        # model's context window stays healthy. math.inf = opt-out (never cut).
+        import math
+        budget = getattr(tool, "max_output_chars", None)
+        if budget is not None and math.isfinite(budget) and len(result.output) > budget:
+            budget = int(budget)
+            truncated = result.output[:budget]
+            # Try to truncate at a newline boundary to avoid cutting mid-line.
+            last_nl = truncated.rfind("\n", budget - 200, budget)
+            if last_nl > budget - 200:
+                truncated = truncated[:last_nl]
+            result = ToolResult(
+                output=(
+                    truncated
+                    + f"\n\n[output truncated at {budget} chars"
+                    + f" — {len(result.output) - budget} chars omitted."
+                    + " Use read_file or python to access the full content.]"
+                ),
+                error=result.error,
+                artifact=result.artifact,
+            )
+        return result
 
 
 def default_registry(llm=None, extraction_llm=None) -> ToolRegistry:
@@ -85,9 +109,11 @@ def default_registry(llm=None, extraction_llm=None) -> ToolRegistry:
     from gemma_miner.tools.dataset_tool import (
         DatasetAppendTool,
         DatasetFromQueueTool,
+        DatasetPatchTool,
         DatasetSampleTool,
         DatasetStatsTool,
     )
+    from gemma_miner.tools.probe_tool import FieldProbeTool, PaginationProbeTool
     from gemma_miner.tools.export_tool import (
         DatasetExportTool,
         DatasetValidateTool,
@@ -137,9 +163,13 @@ def default_registry(llm=None, extraction_llm=None) -> ToolRegistry:
         SaveAttachmentTool(),
         # Dataset
         DatasetAppendTool(),
+        DatasetPatchTool(),
         DatasetFromQueueTool(),
         DatasetStatsTool(),
         DatasetSampleTool(),
+        # Probe tools
+        FieldProbeTool(),
+        PaginationProbeTool(),
         # Queue
         QueueAddTool(),
         QueueNextTool(),
