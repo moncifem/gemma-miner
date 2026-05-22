@@ -54,6 +54,7 @@ def _check_safety(cmd: str) -> str | None:
 
 class BashTool(Tool):
     name = "bash"
+    max_output_chars = 8_000  # explicit; matches "Output is truncated to 8 KB" in description
     description = (
         "Run a bash command. The command runs from the agent's workdir. "
         "Destructive commands are blocked (rm, mv to /, mkfs, dd, shutdown, "
@@ -127,6 +128,7 @@ def _python_error_hints(stderr: str) -> str:
 
 class PythonExecTool(Tool):
     name = "python"
+    max_output_chars = 8_000
     description = (
         "Execute a Python 3 snippet in a fresh subprocess from the workdir. "
         "First-class tool — use it freely for HTTP fetches, JSON parsing, "

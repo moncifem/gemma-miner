@@ -409,6 +409,7 @@ def _try_table_positional_autofix(
 
 class ExtractorDefineTool(Tool):
     name = "extractor_define"
+    summary_fields = ("saved", "matched_rows")
     description = (
         "Save an extraction spec AND IMMEDIATELY test it against the most "
         "recently cached HTML page (or the path you pass in `test_path`). "
@@ -1017,6 +1018,8 @@ def _http_get(
 
 class ScrapePaginatedTool(Tool):
     name = "scrape_paginated"
+    max_output_chars = 5_000  # progress log; detail stays in queue/dataset
+    summary_fields = ("queue_len", "total_added")
     description = (
         "Apply a stored LISTING extractor to many paginated URLs and add "
         "every extracted row to the queue. The URL template uses '{page}' "
@@ -1145,11 +1148,45 @@ class ScrapePaginatedTool(Tool):
         cache_dir = Path(state.workdir) / "cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
 
+        log: list[str] = []
+
+        # Auto-detect 1-indexed sites: if start_page=0 is the default AND
+        # the template has {page}, probe page=0 vs page=1 to see which has more rows.
+        if has_page_placeholder and start == 0 and not args.get("start_page"):
+            try:
+                _, c0, _ = _http_get(template.format(page=0), cache_dir)
+                rows0 = apply_listing_spec(c0.decode("utf-8", errors="replace"), spec)
+                if len(rows0) == 0:
+                    # page=0 empty — try page=1
+                    _, c1, _ = _http_get(template.format(page=1), cache_dir)
+                    rows1 = apply_listing_spec(c1.decode("utf-8", errors="replace"), spec)
+                    if len(rows1) > 0:
+                        start = 1
+                        log.append(
+                            f"auto-detected 1-indexed pagination: page=0→{len(rows0)} rows, "
+                            f"page=1→{len(rows1)} rows. Overriding start_page to 1."
+                        )
+            except Exception:
+                pass  # keep start=0 if probe fails
+
+        # Auto-size max_pages from the plan when the caller used the default
+        if not args.get("max_pages") and target > 100:
+            plan = state.memory.get("plan") or {}
+            plan_pages = plan.get("pages_needed")
+            plan_ipp = plan.get("items_per_page")
+            if isinstance(plan_pages, int) and plan_pages > max_pages:
+                max_pages = plan_pages + 5  # small buffer
+                log.append(f"auto-sized max_pages={max_pages} from plan.pages_needed={plan_pages}")
+            elif isinstance(plan_ipp, int) and plan_ipp > 0 and target > 0:
+                computed = (target // plan_ipp) + 5
+                if computed > max_pages:
+                    max_pages = computed
+                    log.append(f"auto-sized max_pages={max_pages} from target={target}/ipp={plan_ipp}")
+
         queue = state.memory.get("queue", []) or []
         processed = set(str(x) for x in (state.memory.get("processed", []) or []))
         existing_ids = {str(i.get("id")) for i in queue if isinstance(i, dict) and i.get("id")}
 
-        log: list[str] = []
         total_added = 0
         consecutive_zero_new = 0
         page_range = range(start, start + max_pages) if has_page_placeholder else [start]
@@ -1363,6 +1400,8 @@ def _harvest_assets_for_item(
 
 class ProcessQueueTool(Tool):
     name = "process_queue"
+    max_output_chars = 5_000  # per-item progress; full results in dataset
+    summary_fields = ("appended", "remaining_in_queue")
     description = (
         "Process queued items end-to-end. THREE modes (auto-detected):\n\n"
         "  ATTACHMENT — detail spec has `attachment_url`. Fetch detail → "

@@ -157,6 +157,7 @@ def _parse_codebook_proposal(raw: str) -> dict:
 
 class CodebookProposeTool(Tool):
     name = "codebook_propose"
+    summary_fields = ("variables", "type breakdown")
     description = (
         "Sample N items' text content, ask the LLM to design a CODEBOOK of "
         "20–60 typed variables (booleans, integers, floats, enums, dates), "
@@ -455,6 +456,7 @@ def _load_codebook_from_state(state: "AgentState") -> Codebook | None:
 
 class CodebookShowTool(Tool):
     name = "codebook_show"
+    is_readonly = True
     description = (
         "Pretty-print the current codebook (variables, types, descriptions). "
         "Use this when you want to inspect the schema before extracting."
@@ -615,6 +617,7 @@ class CodebookEditTool(Tool):
 
 class CodebookTestTool(Tool):
     name = "codebook_test"
+    summary_fields = ("dataset", "numeric_or_boolean_ratio")
     description = (
         "Apply the current codebook to a SAMPLE of dataset items via "
         "structured LLM extraction, then report per-variable coverage and "

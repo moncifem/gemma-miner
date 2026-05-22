@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 class DatasetAppendTool(Tool):
     name = "dataset_append"
+    summary_fields = ("added", "total_rows_now")
     description = (
         "Append one or more rows to the current dataset (JSONL on disk). Each "
         "row is a JSON object. Rows that violate the dataset's schema, miss "
@@ -112,6 +113,9 @@ class DatasetAppendTool(Tool):
 
 class DatasetStatsTool(Tool):
     name = "dataset_stats"
+    is_readonly = True
+    max_output_chars = 3_000
+    summary_fields = ("rows",)
     description = (
         "Summary of the current dataset: row count, per-field coverage, file path, "
         "and the live status of every active contract. Call this whenever you need "
@@ -139,6 +143,8 @@ class DatasetStatsTool(Tool):
 
 class DatasetSampleTool(Tool):
     name = "dataset_sample"
+    is_readonly = True
+    max_output_chars = 5_000
     description = "Return the first N rows of the dataset as JSON, for inspection."
     args_schema = {"n": {"type": "integer", "default": 3}}
 
@@ -146,6 +152,128 @@ class DatasetSampleTool(Tool):
         n = int(args.get("n") or 3)
         rows = state.dataset.rows()[:n]
         return ToolResult(output=json.dumps(rows, indent=2, ensure_ascii=False))
+
+
+class DatasetPatchTool(Tool):
+    name = "dataset_patch"
+    description = (
+        "Merge new field values into existing dataset rows by id. Only the named "
+        "fields are updated; all other fields are preserved. Use this when a second "
+        "source (API response, detail page) fills in fields that were null in the "
+        "original harvest."
+    )
+    args_schema = {
+        "patches": {
+            "type": "array",
+            "description": (
+                "Array of objects — each must have an `id` field plus the fields "
+                "to update. Or a {\"$file\": \"...\"} reference to a JSON file "
+                "containing the array."
+            ),
+            "items": {"type": "object"},
+        },
+        "id_field": {
+            "type": "string",
+            "default": "id",
+            "description": "Which field to match rows on.",
+        },
+    }
+
+    def run(self, args: dict, state: "AgentState") -> ToolResult:
+        import os
+        from pathlib import Path
+
+        patches = args.get("patches")
+        id_field = args.get("id_field") or "id"
+
+        # patches may be a string (path) or a list
+        if isinstance(patches, str):
+            text = patches.strip()
+            p = Path(text)
+            if not p.is_absolute():
+                p = Path(state.workdir) / p
+            if p.exists():
+                try:
+                    text = p.read_text(encoding="utf-8")
+                except Exception as e:  # noqa: BLE001
+                    return ToolResult(output=f"ERROR reading patch file: {e}", error=True)
+            try:
+                patches = json.loads(text)
+            except Exception:  # noqa: BLE001
+                return ToolResult(
+                    output="ERROR: 'patches' is a string that can't be parsed as JSON.",
+                    error=True,
+                )
+
+        if isinstance(patches, dict):
+            patches = [patches]
+
+        if not isinstance(patches, list):
+            return ToolResult(
+                output=f"ERROR: 'patches' must be a list of objects, got {type(patches).__name__}",
+                error=True,
+            )
+
+        # Build patch lookup
+        patch_map: dict[str, dict] = {}
+        for p in patches:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get(id_field)
+            if pid is not None:
+                patch_map[str(pid)] = p
+
+        if not patch_map:
+            return ToolResult(
+                output=f"ERROR: no patches had a valid '{id_field}' field.",
+                error=True,
+            )
+
+        # Read all rows
+        all_rows = state.dataset.rows()
+
+        patched_count = 0
+        skipped_count = 0
+        updated_rows: list[dict] = []
+        for row in all_rows:
+            rid = str(row.get(id_field, ""))
+            if rid in patch_map:
+                merged = dict(row)
+                for k, v in patch_map[rid].items():
+                    merged[k] = v  # patch wins on conflicts
+                updated_rows.append(merged)
+                patched_count += 1
+            else:
+                updated_rows.append(row)
+                skipped_count += 1
+
+        # Atomically rewrite the dataset file
+        tmp = state.dataset.path.with_suffix(".tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                for r in updated_rows:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, state.dataset.path)
+        except Exception as e:  # noqa: BLE001
+            return ToolResult(output=f"ERROR writing dataset: {e}", error=True)
+
+        # Bust the in-memory cache so subsequent reads see the updated rows
+        state.dataset._rows = None  # type: ignore[assignment]
+        try:
+            state.dataset._load_from_disk()
+        except Exception:  # noqa: BLE001
+            pass
+
+        not_found = len(patch_map) - patched_count
+        return ToolResult(
+            output=(
+                f"patched: {patched_count} rows\n"
+                f"skipped (id not found): {not_found}\n"
+                f"total_rows_now: {len(updated_rows)}"
+            )
+        )
 
 
 class DatasetFromQueueTool(Tool):

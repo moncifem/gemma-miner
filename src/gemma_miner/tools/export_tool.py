@@ -135,6 +135,8 @@ def _format_inferred_stats(s: dict) -> str:
 
 class DatasetValidateTool(Tool):
     name = "dataset_validate"
+    is_readonly = True
+    summary_fields = ("issues",)
     description = (
         "Compute per-variable statistics over the whole dataset using the "
         "current codebook. Output includes coverage, summary stats per type "
@@ -164,6 +166,7 @@ class DatasetValidateTool(Tool):
 
 class DatasetExportTool(Tool):
     name = "dataset_export"
+    summary_fields = ("export ->", "parquet")
     description = (
         "Write the dataset to Parquet (typed via the codebook), plus the "
         "JSONL (already exists at <workdir>/dataset.jsonl), plus an auto-"

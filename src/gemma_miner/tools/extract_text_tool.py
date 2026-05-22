@@ -381,6 +381,7 @@ def _extract_bytes(data: bytes, name: str) -> tuple[str, Any]:
 
 class ExtractTextTool(Tool):
     name = "extract_text"
+    summary_fields = ("text_chars", "n_pages")
     description = (
         "Extract plain text from any file the agent has cached or written. "
         "Dispatches by extension (then magic bytes if unknown). Handles: "

@@ -150,6 +150,7 @@ def extract_one_item(
 
 class ExtractItemsTool(Tool):
     name = "extract_items"
+    summary_fields = ("processed",)
     description = (
         "Apply the current codebook to items in the dataset. For each item we "
         "read its source text, send the codebook's JSON Schema + text to the "

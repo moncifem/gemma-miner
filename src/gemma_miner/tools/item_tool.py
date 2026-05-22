@@ -28,6 +28,7 @@ def _slugify_id(s: str) -> str:
 
 class SaveAttachmentTool(Tool):
     name = "save_attachment"
+    summary_fields = ("attachment_path", "text_chars")
     description = (
         "End-to-end persistence for one attachment of one item. Given a "
         "binary at `source_path` (typically a cache path returned by "

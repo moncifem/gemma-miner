@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -24,6 +25,8 @@ def _resolve(state: "AgentState", path: str) -> Path:
 
 class ReadFileTool(Tool):
     name = "read_file"
+    is_readonly = True
+    max_output_chars = math.inf  # self-bounding via max_chars arg; never double-truncate
     description = "Read a UTF-8 text file from the workdir. Returns the first 8 KB by default."
     args_schema = {
         "path": {"type": "string", "description": "Path relative to workdir."},
@@ -78,6 +81,8 @@ class WriteFileTool(Tool):
 
 class ListDirTool(Tool):
     name = "list_dir"
+    is_readonly = True
+    max_output_chars = 3_000
     description = "List files in a directory under the workdir."
     args_schema = {
         "path": {"type": "string", "default": ".", "description": "Path relative to workdir."},

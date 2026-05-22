@@ -128,6 +128,8 @@ class QueueMarkDoneTool(Tool):
 
 class QueueStatusTool(Tool):
     name = "queue_status"
+    is_readonly = True
+    max_output_chars = 3_000
     description = (
         "Show queue length, processed count, remaining count, and a preview "
         "of the next 3 unprocessed items."

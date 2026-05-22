@@ -145,6 +145,9 @@ def _ext_from_bytes(data: bytes) -> str:
 
 class HttpGetTool(Tool):
     name = "http_get"
+    is_readonly = True
+    max_output_chars = 4_000  # preview + metadata; deeper content goes to cache file
+    summary_fields = ("status", "bytes")
     description = (
         "HTTP GET a URL. Saves the full response body to a file in the workdir's "
         "`cache/` folder, named `<sha1-prefix><real-extension>` (.json, .html, "

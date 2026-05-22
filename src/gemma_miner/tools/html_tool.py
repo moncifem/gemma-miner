@@ -262,10 +262,13 @@ class _StructParser(HTMLParser):
 
 class HtmlInspectTool(Tool):
     name = "html_inspect"
+    is_readonly = True
+    max_output_chars = 6_000  # tag/class summary; rarely needs more
+    summary_fields = ("html_size",)
     description = (
         "Summarise the structure of an HTML page so you can decide on a "
         "repeating-unit selector. REQUIRED ARG: `source` (the file path OR raw "
-        "HTML — aliases `path`/`file`/`html` are also accepted). Returns the "
+        "HTML -- aliases `path`/`file`/`html` are also accepted). Returns the "
         "most frequent tags, CSS classes, and ids. Always run this BEFORE "
         "writing an extractor."
     )
@@ -276,6 +279,25 @@ class HtmlInspectTool(Tool):
         },
         "top_n": {"type": "integer", "default": 25, "description": "How many of each to show."},
     }
+
+    def description_dynamic(self, args: dict, state: "AgentState") -> str | None:
+        from pathlib import Path as _P
+        cache = _P(state.workdir) / "cache"
+        if not cache.exists():
+            return None
+        html_files = sorted(
+            [f for f in cache.iterdir() if f.suffix in (".html", ".htm") and f.is_file()],
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        )
+        if not html_files:
+            return None
+        names = ", ".join(f.name for f in html_files[:5])
+        suffix = f" (+{len(html_files) - 5} more)" if len(html_files) > 5 else ""
+        return (
+            self.description
+            + f" Cache has {len(html_files)} HTML file(s): {names}{suffix}."
+        )
 
     def run(self, args: dict, state: "AgentState") -> ToolResult:
         src, err = _resolve_source_arg(state, args)
@@ -381,6 +403,8 @@ def _strip_tags(s: str) -> str:
 
 class HtmlFindTool(Tool):
     name = "html_find"
+    is_readonly = True
+    max_output_chars = 5_000
     description = (
         "Find HTML elements by a CLASS TOKEN (no regex required). Pass "
         "`source` (file path or HTML) and `class_token` (e.g. 'athing' or "
@@ -483,6 +507,9 @@ class HtmlFindTool(Tool):
 
 class HtmlExtractTool(Tool):
     name = "html_extract"
+    is_readonly = True
+    max_output_chars = 5_000
+    summary_fields = ("total_matches",)
     description = (
         "Extract repeating blocks from an HTML file using a regex over the raw "
         "HTML. REQUIRED ARGS: `source` (file path or HTML; aliases path/file/"

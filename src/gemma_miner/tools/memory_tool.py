@@ -34,6 +34,7 @@ class MemorySetTool(Tool):
 
 class MemoryGetTool(Tool):
     name = "memory_get"
+    is_readonly = True
     description = "Retrieve a previously stored memory value by key."
     args_schema = {"key": {"type": "string"}}
 
@@ -49,6 +50,7 @@ class MemoryGetTool(Tool):
 
 class MemoryListTool(Tool):
     name = "memory_list"
+    is_readonly = True
     description = "List all memory keys (not values)."
     args_schema = {}
 

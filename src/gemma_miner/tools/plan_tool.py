@@ -215,6 +215,7 @@ class SetPlanTool(Tool):
 
 class ShowPlanTool(Tool):
     name = "show_plan"
+    is_readonly = True
     description = (
         "Print the currently-saved plan (or 'no plan yet' if set_plan hasn't "
         "been called)."
